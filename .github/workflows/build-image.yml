@@ -29,7 +29,8 @@ on:
 jobs:
   publish_images:
     name: 'Build NethSecurity image'
-    runs-on: self-hosted
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
     env:
       APK_PUB_KEY: ${{ secrets.APK_PUB_KEY }}
       APK_PRIV_KEY: ${{ secrets.APK_PRIV_KEY }}
@@ -38,6 +39,20 @@ jobs:
       HAS_DO_SPACE_CREDS: ${{ secrets.DO_SPACE_ACCESS_KEY != '' && secrets.DO_SPACE_SECRET_KEY != '' }}
     steps:
       - uses: actions/checkout@v7
+      - name: Free disk space
+        run: |
+          df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/local/lib/node_modules
+          sudo docker system prune --all --force || true
+          # rootless podman keeps images and volumes in its graphroot: move it to the bigger /mnt disk
+          sudo mkdir -p /mnt/containers
+          sudo chown "$(id -u):$(id -g)" /mnt/containers
+          mkdir -p ~/.config/containers
+          printf '[storage]\ndriver = "overlay"\ngraphroot = "/mnt/containers"\n' > ~/.config/containers/storage.conf
+          podman info --format '{{.Store.GraphRoot}}'
+          df -h / /mnt
       - name: Build the image
         env:
           OWRT_VERSION: ${{ inputs.owrt_version }}

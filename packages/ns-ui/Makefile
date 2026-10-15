@@ -11,8 +11,9 @@ PKG_VERSION:=2.27.1
 PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/NethServer/nethsecurity-ui.git
-PKG_SOURCE_VERSION:=$(PKG_VERSION)
+PKG_SOURCE_URL:=https://github.com/phatdo1819/nethsecurity-ui.git
+# feat/ovpnrw-multi-instance
+PKG_SOURCE_VERSION:=ba691d6e883c30c9466e57b7c6b7556fd0b2ed82
 PKG_SOURCE_SUBDIR:=nethsecurity-ui-$(PKG_SOURCE_VERSION)
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_SOURCE_SUBDIR)
 PKG_MIRROR_HASH:=skip
