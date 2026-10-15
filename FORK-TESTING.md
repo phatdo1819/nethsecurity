@@ -103,6 +103,18 @@ To install a newer version of the files, repeat steps 1–4: the backup of the o
 5. **Connection history**: the "all servers" view shows a Server column, and the CSV export contains
    the server name.
 6. **Users filter**: the filter box on the Users & Objects page finds users by name or description.
+7. **Traffic between servers** (routed servers only, off by default):
+   1. connect a client to server A and one to server B; ping each other's VPN address: it fails
+   2. edit server A, open the advanced settings and turn on "Allow traffic with other Road Warrior servers";
+      save and apply the changes. The ping still fails: the option must be on for both servers
+   3. turn it on for server B too and apply: both servers restart, the clients reconnect and get the routes.
+      The ping now works in both directions
+   4. turn it off on one of the two servers: the ping fails again
+   5. the firewall rules page shows a system rule `Allow-OpenVPNRW<N>-inter-server` for each enabled server
+      while the traffic is allowed, and none when it is not
+
+   Windows blocks incoming ping by default: allow it in the Windows firewall of the client you ping, or test
+   with another service, such as a shared folder.
 
 Useful commands on the firewall:
 
@@ -110,9 +122,17 @@ Useful commands on the firewall:
 logread -e openvpn
 api-cli ns.ovpnrw list-instances
 uci show users | grep openvpn_
+uci show openvpn | grep -E 'ns_inter_server|push'
+uci show firewall | grep inter_server
+ip route
 ```
 
+On a client, `route print` (Windows) or `ip route` (Linux) shows the routes received from the server.
+
 ## Undo
+
+Before undoing, turn off "Allow traffic with other Road Warrior servers" on all the servers and apply the
+changes: the original files don't know the option, so they would leave its routes and firewall rules in place.
 
 ```sh
 ssh $FW "sh /root/ns-test-backup/install-on-device.sh --restore"
