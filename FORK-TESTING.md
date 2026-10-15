@@ -115,6 +115,14 @@ To install a newer version of the files, repeat steps 1–4: the backup of the o
 
    Windows blocks incoming ping by default: allow it in the Windows firewall of the client you ping, or test
    with another service, such as a shared folder.
+8. **Many servers**:
+   1. with up to 5 servers each one has a tab; give one a long name: the tab bar scrolls instead of the page
+   2. add servers until there are 6: the tab bar shows only "Servers" and "Connection history", and a
+      "Server" list, searchable by name, selects the server. Disabled servers are marked in the list
+   3. open the connection history and go back to "Servers": the last server is shown again
+   4. with more than 10 servers having connections, the "all servers" history and the CSV export include
+      every server, and filtering on any single server shows its connections
+   5. delete servers until there are 5: each server gets its tab back
 
 Useful commands on the firewall:
 
