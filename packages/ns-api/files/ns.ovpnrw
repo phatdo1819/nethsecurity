@@ -417,7 +417,10 @@ def remove_instance(instance):
         remove_tap_from_bridge(u, old_bridge, old_dev)
 
     u.delete("openvpn", instance)
-    
+    # the other instances must stop pushing the route to this instance; its own firewall rule
+    # is removed below, with the other sections linked to the instance
+    ovpn.sync_inter_server_traffic(u)
+
     # archive connection history databases before removing the instance directory
     archive_connections_db(instance)
     shutil.rmtree(f"/etc/openvpn/{instance}", ignore_errors=True)
@@ -460,10 +463,17 @@ def get_configuration(ovpninstance):
     if not ret.get("mssfix"):
         ret["mssfix"] = "1450"
 
+    # routes to the other Road Warrior instances are managed by ovpn.sync_inter_server_traffic
+    inter_server_routes = ovpn.get_inter_server_routes(u, ovpninstance)
+    ret.pop('ns_inter_server_route', None)
+    ret['ns_inter_server'] = ret.get('ns_inter_server', '0')
+
     if ret.get('push'):
         local = []
         dhcp_options = []
         for r in ret.pop('push'):
+            if r in inter_server_routes:
+                continue
             if r.startswith("route"):
                  local.append(ovpn.opt2cidr(r.removeprefix("route ")))
             elif r.startswith("redirect-gateway"):
@@ -518,6 +528,11 @@ def set_configuration(args):
                 return utils.validation_error("ns_description", "description_already_used", args["ns_description"])
     if args.get("port") and ovpn.find_conflicting_port(u, args["port"], args.get("proto", "udp"), exclude=ovpninstance):
         return utils.validation_error("port", "port_already_used", args["port"])
+    # optional, so callers not aware of it don't change it
+    if "ns_inter_server" in args:
+        if args["ns_inter_server"] not in ("0", "1"):
+            return utils.validation_error("ns_inter_server", "invalid_value", args["ns_inter_server"])
+        u.set("openvpn", ovpninstance, "ns_inter_server", args["ns_inter_server"])
     u.set("openvpn", ovpninstance, "enabled", args["enabled"])
     if args["ns_redirect_gateway"] == "1":
         push_options.append("redirect-gateway")
@@ -653,6 +668,8 @@ def set_configuration(args):
     u.set("openvpn", ovpninstance, "mssfix", args.get("mssfix", '1450'))
 
     u.save("openvpn")
+    # the network or the device type may have changed: update the other instances too
+    ovpn.sync_inter_server_traffic(u)
 
     return {"result": "success"}
 
@@ -1384,6 +1401,7 @@ if cmd == 'list':
             "ifconfig_pool": ["10.166.54.4", "10.166.54.20"],
             "tun_mtu": "1500",
             "mssfix": "1450",
+            "ns_inter_server": "0",
             },
         "remove-instance": {"instance": "roadwarrior1"},
         "import-users": {"instance": "roadwarrior1"},

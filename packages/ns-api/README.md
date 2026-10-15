@@ -1539,6 +1539,7 @@ Response example for a server in routed mode:
     "192.168.100.238"
   ],
   "ns_redirect_gateway": "0",
+  "ns_inter_server": "0",
   "ns_local": [
     "192.168.101.0/24",
     "192.168.100.0/24"
@@ -1764,6 +1765,15 @@ The API can raise the following validation errors, in addition to the ones relat
 - `description_already_used` (`ns_description`): another instance has the same name
 - `port_already_used` (`port`): another server is using the same port and protocol
 - `network_already_used` (`server`): the network overlaps the one of another server
+
+The optional `ns_inter_server` field (`0` or `1`, default `0`) allows the clients of the server to talk to the
+clients of the other Road Warrior servers having the same option enabled. It applies only to routed (`tun`) servers.
+If the field is omitted, the current value is kept. When it is enabled on two or more servers, each of them:
+- pushes to its clients a route to the networks of the other enabled servers
+- gets the system firewall rule `<instance>_inter_server`, accepting the traffic from its network to those networks
+
+The routes added this way are not returned in the `ns_local` field of `get-configuration`.
+Connected clients get the new routes when they reconnect.
 
 Configure a routed server:
 ```

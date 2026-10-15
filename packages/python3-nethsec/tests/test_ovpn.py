@@ -320,3 +320,82 @@ def test_remove_user_access_errors(tmp_path, mocker):
     mocker.patch('nethsec.ovpn.revoke_user_certificate', side_effect=[Exception('easyrsa failed'), True])
     # a failure on one instance does not stop the others
     assert ovpn.remove_user_access(u, _user(u, 'ns_new')) == ['ns_roadwarrior1']
+
+def _push(u, instance):
+    return list(u.get('openvpn', instance, 'push', list=True, default=[]))
+
+def test_sync_inter_server_traffic(tmp_path):
+    u = _setup_rw(tmp_path)
+    tmp_path.joinpath('firewall').write_text('')
+    rw1_push = ['route 192.168.1.0 255.255.255.0', 'dhcp-option DNS 192.168.1.1']
+    u.set('openvpn', 'ns_roadwarrior1', 'push', rw1_push)
+    rule1 = ovpn.get_inter_server_rule('ns_roadwarrior1')
+    rule3 = ovpn.get_inter_server_rule('ns_roadwarrior3')
+
+    # a single enabled instance has nobody to talk to
+    u.set('openvpn', 'ns_roadwarrior1', 'ns_inter_server', '1')
+    assert ovpn.sync_inter_server_traffic(u) == []
+    assert _push(u, 'ns_roadwarrior1') == rw1_push
+    assert u.get('firewall', rule1, default=None) is None
+
+    # two enabled instances: routes are pushed and the traffic is accepted in both directions
+    u.set('openvpn', 'ns_roadwarrior3', 'ns_inter_server', '1')
+    assert ovpn.sync_inter_server_traffic(u) == ['ns_roadwarrior1', 'ns_roadwarrior3']
+    assert _push(u, 'ns_roadwarrior1') == rw1_push + ['route 10.30.0.0 255.255.255.0']
+    assert _push(u, 'ns_roadwarrior3') == ['route 10.20.0.0 255.255.255.0']
+    assert _push(u, 'ns_roadwarrior4') == []
+    assert ovpn.get_inter_server_routes(u, 'ns_roadwarrior1') == ['route 10.30.0.0 255.255.255.0']
+    assert u.get('firewall', rule1, 'src') == 'rwopenvpn'
+    assert u.get('firewall', rule1, 'dest') == 'rwopenvpn'
+    assert list(u.get('firewall', rule1, 'src_ip', list=True)) == ['10.20.0.0/24']
+    assert list(u.get('firewall', rule1, 'dest_ip', list=True)) == ['10.30.0.0/24']
+    assert u.get('firewall', rule1, 'proto') == 'all'
+    assert u.get('firewall', rule1, 'target') == 'ACCEPT'
+    assert u.get('firewall', rule1, 'ns_link') == 'openvpn/ns_roadwarrior1'
+    assert list(u.get('firewall', rule3, 'dest_ip', list=True)) == ['10.20.0.0/24']
+    assert u.get('firewall', ovpn.get_inter_server_rule('ns_roadwarrior4'), default=None) is None
+
+    # nothing to do when the configuration is already applied
+    assert ovpn.sync_inter_server_traffic(u) == []
+
+    # the API rewrites the push options without the managed routes: they are added back
+    u.set('openvpn', 'ns_roadwarrior1', 'push', rw1_push)
+    assert ovpn.sync_inter_server_traffic(u) == ['ns_roadwarrior1']
+    assert _push(u, 'ns_roadwarrior1') == rw1_push + ['route 10.30.0.0 255.255.255.0']
+
+    # a changed network replaces the old route
+    u.set('openvpn', 'ns_roadwarrior3', 'server', '10.31.0.0 255.255.255.0 nopool')
+    assert ovpn.sync_inter_server_traffic(u) == ['ns_roadwarrior1']
+    assert _push(u, 'ns_roadwarrior1') == rw1_push + ['route 10.31.0.0 255.255.255.0']
+    assert list(u.get('firewall', rule1, 'dest_ip', list=True)) == ['10.31.0.0/24']
+
+    # disabling one side removes routes and rules from both, other push options are kept
+    u.set('openvpn', 'ns_roadwarrior3', 'ns_inter_server', '0')
+    assert ovpn.sync_inter_server_traffic(u) == ['ns_roadwarrior1', 'ns_roadwarrior3']
+    assert _push(u, 'ns_roadwarrior1') == rw1_push
+    assert _push(u, 'ns_roadwarrior3') == []
+    assert ovpn.get_inter_server_routes(u, 'ns_roadwarrior1') == []
+    assert u.get('firewall', rule1, default=None) is None
+    assert u.get('firewall', rule3, default=None) is None
+
+def test_sync_inter_server_traffic_tap_and_removed(tmp_path):
+    u = _setup_rw(tmp_path)
+    tmp_path.joinpath('firewall').write_text('')
+    for instance in ['ns_roadwarrior1', 'ns_roadwarrior3', 'ns_roadwarrior4']:
+        u.set('openvpn', instance, 'ns_inter_server', '1')
+    ovpn.sync_inter_server_traffic(u)
+    assert _push(u, 'ns_roadwarrior1') == ['route 10.30.0.0 255.255.255.0', 'route 10.40.0.0 255.255.255.0']
+
+    # tap instances are bridged to a LAN: they don't take part
+    u.set('openvpn', 'ns_roadwarrior4', 'dev_type', 'tap')
+    assert ovpn.is_inter_server_enabled(u, 'ns_roadwarrior4') == False
+    ovpn.sync_inter_server_traffic(u)
+    assert _push(u, 'ns_roadwarrior1') == ['route 10.30.0.0 255.255.255.0']
+    assert _push(u, 'ns_roadwarrior4') == []
+    assert u.get('firewall', ovpn.get_inter_server_rule('ns_roadwarrior4'), default=None) is None
+
+    # a removed instance is not reachable anymore
+    u.delete('openvpn', 'ns_roadwarrior3')
+    ovpn.sync_inter_server_traffic(u)
+    assert _push(u, 'ns_roadwarrior1') == []
+    assert u.get('firewall', ovpn.get_inter_server_rule('ns_roadwarrior1'), default=None) is None
