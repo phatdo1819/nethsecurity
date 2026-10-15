@@ -83,10 +83,14 @@ so the access does not change after the upgrade.
 ## Connection history
 
 The `connection-history` and `connection-history-csv` methods of `ns.ovpnrw` work on a single instance,
-or on all the instances if the `instance` parameter is omitted. In the second case the databases are attached
-in read-only mode and queried together: every row contains the `instance` field.
+or on all the instances if the `instance` parameter is omitted: every row contains the `instance` field.
 
-SQLite attaches at most 10 databases per connection, so the aggregated history includes the first 10 instances only.
+SQLite can attach at most 10 databases to a connection, so the instances can't be queried together.
+Instead, each database is opened on its own in read-only mode and runs the same filtered query, sorted
+(`query_connections_history`). The sorted rows of the instances are merged lazily (`heapq.merge`), so a page
+reads only the rows it needs from each database and there is no limit on the number of instances.
+Counters are the sum of the counters of the databases. Sorting by IP address still loads all the matching rows,
+like with a single instance.
 
 ## Related code
 
