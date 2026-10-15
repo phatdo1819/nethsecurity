@@ -9,9 +9,11 @@
 Library for common VPN functions.
 """
 
+import os
 import json
 import ipaddress
 import random
+import re
 import struct
 import socket
 import subprocess
@@ -249,18 +251,22 @@ def generate_random_port(uci, limit_min, limit_max):
         port = random.randint(limit_min, limit_max)
     return port
 
-def is_used_port(uci, port):
+def is_used_port(uci, port, exclude=None):
     '''
     Check if a port is already used by another OpenVPN.
 
     Arguments:
         - uci -- EUci instance
         - port -- port to check
+        - exclude -- optional OpenVPN instance name to ignore, useful when
+          validating the new port of an already existing instance
 
     Returns:
         - True if the port is already used, False otherwise
     '''
     for v in uci.get_all('openvpn'):
+        if v == exclude:
+            continue
         rport = int(uci.get('openvpn', v, 'port', default="0"))
         lport = int(uci.get('openvpn', v, 'lport', default="0"))
         if port == rport or port == lport:
@@ -283,3 +289,430 @@ def list_connected_clients(openvpninstance, type="subnet"):
     except:
         return {}
     return json.loads(p.stdout)
+
+
+def find_overlapping_network(uci, network, exclude=None):
+    """
+    Search for an OpenVPN server using a network overlapping the given one.
+
+    Arguments:
+      - uci -- EUci instance
+      - network -- network to check, in CIDR notation
+      - exclude -- optional OpenVPN instance name to ignore
+
+    Returns:
+      - the name of the first conflicting instance, None if there are no conflicts
+    """
+    target = ipaddress.ip_network(network, strict=False)
+    try:
+        sections = uci.get_all('openvpn')
+    except:
+        return None
+    for v in sections:
+        if v == exclude:
+            continue
+        server = opt2cidr(uci.get('openvpn', v, 'server', default=""))
+        if server and ipaddress.ip_network(server, strict=False).overlaps(target):
+            return v
+    return None
+
+
+def find_conflicting_port(uci, port, proto, exclude=None):
+    """
+    Search for an OpenVPN server listening on the same port with the same protocol.
+    Only servers are checked: the port of a client is the remote one.
+
+    Arguments:
+      - uci -- EUci instance
+      - port -- port to check
+      - proto -- protocol to check (udp or tcp)
+      - exclude -- optional OpenVPN instance name to ignore
+
+    Returns:
+      - the name of the first conflicting instance, None if there are no conflicts
+    """
+    try:
+        sections = uci.get_all('openvpn')
+    except:
+        return None
+    for v in sections:
+        if v == exclude:
+            continue
+        if not uci.get('openvpn', v, 'server', default='') and not uci.get('openvpn', v, 'server_bridge', default=''):
+            continue
+        if str(uci.get('openvpn', v, 'port', default='1194')) != str(port):
+            continue
+        if uci.get('openvpn', v, 'proto', default='udp')[:3] == str(proto)[:3]:
+            return v
+    return None
+
+
+def list_roadwarrior_instances(uci):
+    """
+    List the Road Warrior instances created by NethSecurity.
+
+    Arguments:
+      - uci -- EUci instance
+
+    Returns:
+      - a list of instance names
+    """
+    ret = []
+    instances = utils.get_all_by_type(uci, "openvpn", "openvpn") or {}
+    for name, instance in instances.items():
+        tag = instance.get("ns_tag")
+        if tag and "automated" in tag:
+            ret.append(name)
+    return ret
+
+
+def next_instance_number(uci):
+    """
+    Return the lowest instance number not used by any Road Warrior instance.
+
+    The number is used to build the instance name (ns_roadwarrior<N>), the network
+    device (tunrw<N>/taprw<N>) and the firewall service name (OpenVPNRW<N>), so it
+    must be unique even if a previous instance has been removed.
+
+    Arguments:
+      - uci -- EUci instance
+
+    Returns:
+      - the instance number
+    """
+    used = set()
+    for name in list_roadwarrior_instances(uci):
+        match = re.search(r"\d+", name)
+        if match:
+            used.add(int(match.group()))
+    number = 1
+    while number in used or uci.get("openvpn", utils.get_id(f"roadwarrior{number}"), default=None) is not None:
+        number += 1
+    return number
+
+
+# Per-instance user membership
+#
+# A user can be authorized on more than one Road Warrior instance, for example when
+# the same user database is shared by two instances. The following user options
+# keep the state of each instance independent:
+#
+#   - openvpn_instances: list of instances the user belongs to
+#   - openvpn_disabled: list of instances where the user is disabled (subset of openvpn_instances)
+#
+# The openvpn_enabled option is still maintained (1 if the user is enabled on at least
+# one instance) for the code reading it directly. Users without openvpn_instances
+# are legacy users: they are authorized on all the instances using their database
+# if openvpn_enabled is 1. See migrate_user_memberships().
+#
+# The openvpn_ipaddr and openvpn_2fa options are shared between all the instances:
+# a reserved IP address is applied only on the instance whose network contains it.
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def get_user_instances(user):
+    """
+    Return the instances a user belongs to.
+
+    Arguments:
+      - user -- user object, as returned by users.get_user_by_name
+
+    Returns:
+      - a list of instance names, None for legacy users without explicit membership
+    """
+    if user.get('openvpn_instances') is None:
+        return None
+    return _as_list(user.get('openvpn_instances'))
+
+
+def is_user_member(user, instance):
+    """
+    Check if a user belongs to an instance, regardless of being enabled.
+
+    Arguments:
+      - user -- user object, as returned by users.get_user_by_name
+      - instance -- OpenVPN instance name
+
+    Returns:
+      - True if the user belongs to the instance
+    """
+    instances = get_user_instances(user)
+    if instances is None:
+        return 'openvpn_enabled' in user
+    return instance in instances
+
+
+def is_user_enabled(user, instance):
+    """
+    Check if a user is allowed to connect to an instance.
+
+    Arguments:
+      - user -- user object, as returned by users.get_user_by_name
+      - instance -- OpenVPN instance name
+
+    Returns:
+      - True if the user belongs to the instance and is not disabled
+    """
+    instances = get_user_instances(user)
+    if instances is None:
+        return user.get('openvpn_enabled', '0') == '1'
+    return instance in instances and instance not in _as_list(user.get('openvpn_disabled'))
+
+
+def get_user_membership(uci, user):
+    """
+    Return the instances a user belongs to and the ones where it is disabled.
+    Legacy users, without explicit membership, belong to all the instances using their database.
+
+    Arguments:
+      - uci -- EUci instance
+      - user -- user object, as returned by users.get_user_by_name
+
+    Returns:
+      - a tuple of two lists: the instances and the disabled instances
+    """
+    instances = get_user_instances(user)
+    if instances is not None:
+        return instances, [i for i in _as_list(user.get('openvpn_disabled')) if i in instances]
+    # legacy user: authorized on all the instances using its database
+    if 'openvpn_enabled' not in user:
+        return [], []
+    instances = [
+        i for i in list_roadwarrior_instances(uci)
+        if uci.get('openvpn', i, 'ns_user_db', default='') == user.get('database', '')
+    ]
+    disabled = instances if user.get('openvpn_enabled') != '1' else []
+    return instances, list(disabled)
+
+
+def _delete_option(uci, user_id, option):
+    try:
+        uci.delete('users', user_id, option)
+    except:
+        pass
+
+
+def _save_membership(uci, user_id, instances, disabled):
+    instances = list(dict.fromkeys(instances))
+    disabled = [i for i in dict.fromkeys(disabled) if i in instances]
+    if instances:
+        uci.set('users', user_id, 'openvpn_instances', instances)
+        if disabled:
+            uci.set('users', user_id, 'openvpn_disabled', disabled)
+        else:
+            _delete_option(uci, user_id, 'openvpn_disabled')
+        enabled = any(i not in disabled for i in instances)
+        uci.set('users', user_id, 'openvpn_enabled', '1' if enabled else '0')
+    else:
+        for option in ['openvpn_instances', 'openvpn_disabled', 'openvpn_enabled', 'openvpn_ipaddr', 'openvpn_2fa']:
+            _delete_option(uci, user_id, option)
+
+
+def add_user_instance(uci, user, instance, enabled=True):
+    """
+    Add a user to an instance, or change its status if already there.
+    The changes are not committed.
+
+    Arguments:
+      - uci -- EUci instance
+      - user -- user object, as returned by users.get_user_by_name
+      - instance -- OpenVPN instance name
+      - enabled -- if False the user is added as disabled
+    """
+    instances, disabled = get_user_membership(uci, user)
+    if instance not in instances:
+        instances.append(instance)
+    disabled = [i for i in disabled if i != instance]
+    if not enabled:
+        disabled.append(instance)
+    _save_membership(uci, user['id'], instances, disabled)
+
+
+def set_user_instance_enabled(uci, user, instance, enabled):
+    """
+    Enable or disable a user on a single instance.
+    The changes are not committed.
+
+    Arguments:
+      - uci -- EUci instance
+      - user -- user object, as returned by users.get_user_by_name
+      - instance -- OpenVPN instance name
+      - enabled -- True to enable the user, False to disable it
+    """
+    add_user_instance(uci, user, instance, enabled)
+
+
+def remove_user_instance(uci, user, instance):
+    """
+    Remove a user from an instance. All OpenVPN options are removed from the user
+    when it does not belong to any other instance.
+    The changes are not committed.
+
+    Arguments:
+      - uci -- EUci instance
+      - user -- user object, as returned by users.get_user_by_name
+      - instance -- OpenVPN instance name
+
+    Returns:
+      - True if the user does not belong to any instance anymore
+    """
+    instances, disabled = get_user_membership(uci, user)
+    if instance in instances:
+        instances = [i for i in instances if i != instance]
+    elif instances:
+        # not a member of this instance, nothing to do
+        return False
+    _save_membership(uci, user['id'], instances, disabled)
+    return len(instances) == 0
+
+
+def get_instance_network(uci, instance):
+    """
+    Return the network of the clients of a Road Warrior instance.
+
+    Arguments:
+      - uci -- EUci instance
+      - instance -- OpenVPN instance name
+
+    Returns:
+      - an ipaddress network object, None if the instance has no valid server network
+    """
+    server = uci.get('openvpn', instance, 'server', default='')
+    if not server:
+        server = uci.get('openvpn', instance, 'server_bridge', default='')
+    parts = server.split(" ")
+    if len(parts) < 2 or not parts[0]:
+        return None
+    try:
+        return ipaddress.ip_network(f'{parts[0]}/{parts[1]}', strict=False)
+    except ValueError:
+        return None
+
+
+def get_reserved_ip(uci, user, instance):
+    """
+    Return the IP address reserved for a user on an instance.
+    The reservation is shared between instances, but it applies only to the
+    instance whose network contains the address.
+
+    Arguments:
+      - uci -- EUci instance
+      - user -- user object, as returned by users.get_user_by_name
+      - instance -- OpenVPN instance name
+
+    Returns:
+      - the reserved IP address, an empty string if there is no reservation for the instance
+    """
+    ipaddr = user.get('openvpn_ipaddr', '')
+    network = get_instance_network(uci, instance)
+    if not ipaddr or network is None:
+        return ''
+    try:
+        if ipaddress.ip_address(ipaddr) in network:
+            return ipaddr
+    except ValueError:
+        pass
+    return ''
+
+
+def disconnect_client(instance, username):
+    """
+    Disconnect a client from an instance, using the management socket.
+
+    Arguments:
+      - instance -- OpenVPN instance name
+      - username -- client common name
+
+    Returns:
+      - True if the client has been disconnected, False otherwise (e.g. it was not connected)
+    """
+    try:
+        subprocess.run(["/usr/bin/openvpn-kill", f"/var/run/openvpn_{instance}.socket", username],
+                       capture_output=True, check=True)
+        return True
+    except Exception:
+        return False
+
+
+def revoke_user_certificate(instance, username):
+    """
+    Revoke the certificate of a user and regenerate the CRL of the instance.
+    The certificate is moved out of the issued directory, so a new one can be created for the same user name.
+
+    Arguments:
+      - instance -- OpenVPN instance name
+      - username -- user name, it is the certificate common name
+
+    Returns:
+      - True if the certificate has been revoked, False if the user has no certificate
+
+    Raises:
+      - ValueError if the user name is not a valid file name
+      - subprocess.CalledProcessError if easyrsa fails
+    """
+    if not username or os.path.basename(username) != username or username.startswith('.'):
+        raise ValueError(f"invalid user name: {username}")
+    pki = f"/etc/openvpn/{instance}/pki"
+    if not os.path.exists(f"{pki}/issued/{username}.crt"):
+        return False
+    env = os.environ.copy()
+    env["EASYRSA_BATCH"] = "1"
+    env["EASYRSA_PKI"] = pki
+    env["EASYRSA_CRL_DAYS"] = "3650"
+    subprocess.run(["/usr/bin/easyrsa", "revoke", username], env=env, check=True, capture_output=True)
+    subprocess.run(["/usr/bin/easyrsa", "gen-crl"], env=env, check=True, capture_output=True)
+    return True
+
+
+def remove_user_access(uci, user):
+    """
+    Remove the access of a user to all the Road Warrior instances it belongs to: the user is disconnected
+    and its certificates are revoked. It must be called when a user is deleted from its database,
+    passing the user object read before the deletion, so the membership is still available.
+    Certificates are revoked immediately, the UCI changes are not touched.
+
+    Arguments:
+      - uci -- EUci instance
+      - user -- user object, as returned by users.get_user_by_name
+
+    Returns:
+      - the list of instances where the certificate could not be revoked
+    """
+    errors = []
+    for instance in get_user_membership(uci, user)[0]:
+        disconnect_client(instance, user['name'])
+        try:
+            revoke_user_certificate(instance, user['name'])
+        except Exception:
+            errors.append(instance)
+    return errors
+
+
+def migrate_user_memberships(uci):
+    """
+    Convert legacy users to explicit per-instance membership.
+    The changes are not committed.
+
+    Arguments:
+      - uci -- EUci instance
+
+    Returns:
+      - the number of migrated users
+    """
+    migrated = 0
+    users = utils.get_all_by_type(uci, 'users', 'user') or {}
+    for user_id, user in users.items():
+        if 'openvpn_instances' in user or 'openvpn_enabled' not in user:
+            continue
+        user = dict(user, id=user_id)
+        instances, disabled = get_user_membership(uci, user)
+        if instances:
+            _save_membership(uci, user_id, instances, disabled)
+            migrated += 1
+    return migrated

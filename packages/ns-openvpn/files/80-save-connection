@@ -10,7 +10,7 @@ import os
 import sys
 import sqlite3
 from euci import EUci
-from nethsec import users
+from nethsec import users, ovpn
 
 def get_db_path(instance):
     u = EUci()
@@ -47,7 +47,7 @@ try:
         cn = cn.split('@')[0]
     user = users.get_user_by_name(uci, cn, db)
     if user:
-        ipaddr = user.get('openvpn_ipaddr', '')
+        ipaddr = ovpn.get_reserved_ip(uci, user, instance)
         if ipaddr:
             virtual_ip_addr = ipaddr
 except:

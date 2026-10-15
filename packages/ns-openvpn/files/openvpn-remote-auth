@@ -15,7 +15,7 @@ import os
 import sys
 import subprocess
 from euci import EUci
-from nethsec import users
+from nethsec import users, ovpn
 
 def debug(msg):
     if os.environ.get("debug", False):
@@ -47,8 +47,8 @@ if user is None:
     debug(f"Error: user '{user}' not found")
     sys.exit(4)
 
-if not "openvpn_enabled" in user or user["openvpn_enabled"] != "1":
-    # user not enabled
+if not ovpn.is_user_enabled(user, instance):
+    # user not enabled on this instance
     debug(f"Error: user '{user}' disabled")
     sys.exit(3)
 

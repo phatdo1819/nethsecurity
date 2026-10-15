@@ -31,9 +31,16 @@ Supported authentication methods:
 
 Network and firewall configuration:
 
-- the network device is named `tunrw`
+- the network device is named `tunrw<N>` (`taprw<N>` in bridged mode), where `<N>` is the instance number
 - the default zone for the device is named `rwopenvpn`: this is a trusted zone,
   it will have access to `lan` and `wan` zones, it will be also accessible from `lan` zone
+
+### Multiple instances
+
+More instances can be created, each one is independent: it has its own name, port, network, certificates and connection history.
+Instances can use the same users database, so the same user name and password can be used on all of them.
+The users of an instance are saved inside the `openvpn_instances` option, see the
+[design document](../../docs/design/openvpn_roadwarrior.md) for details.
 
 ### First configuration
 
@@ -68,9 +75,12 @@ All APIs are documented inside the [ns-api](../ns-api/#nsovpnrw) page.
 
 Each user must have an entry of type `user` or `local-user` inside `users` UCI configuration file
 and must have at least the following fields:
+- `openvpn_instances`: list of the instances the user belongs to, the user can authenticate only on these instances
 - `openvpn_enabled`: can be `0` or `1`, if set to `0` the user can't authenticate itself
 
 Each user can have also the following options:
+
+- `openvpn_disabled`: list of the instances where the user is disabled
 
 - `openvpn_ipaddr`: IP address reserved for the user
 - `openvpn_2fa`: OTP secret

@@ -11,8 +11,16 @@ import os
 import sys
 import json
 import subprocess
-from nethsec import utils, users
+from nethsec import utils, users, ovpn
 from euci import EUci
+
+def remove_vpn_access(u, user):
+    # a deleted user is disconnected from all the OpenVPN Road Warrior servers and its certificates
+    # are revoked, the deletion succeeds even if the revocation fails: the user can't log in anymore
+    if not user:
+        return
+    for instance in ovpn.remove_user_access(u, user):
+        print(f"Cannot revoke the certificate of {user['name']} on {instance}", file=sys.stderr)
 
 cmd = sys.argv[1]
 
@@ -85,7 +93,9 @@ else:
                         extra[field] = info[field]
             ret = {"id": users.edit_local_user(u, args['name'], args.get('password'), args.get('description',''), args['database'], extra)}
         elif action == "delete-local-user":
+            user = users.get_user_by_name(u, args['name'], args['database'])
             users.delete_local_user(u, args['name'], args['database'])
+            remove_vpn_access(u, user)
             ret = {"result": "success"}
 
         elif action == "add-remote-user":
@@ -93,7 +103,9 @@ else:
         elif action == "edit-remote-user":
             ret = {"id": users.edit_remote_user(u, args['name'], args['database'], args["extra"])}
         elif action == "delete-remote-user":
+            user = users.get_user_by_name(u, args['name'], args['database'])
             users.delete_remote_user(u, args['name'], args['database'])
+            remove_vpn_access(u, user)
             ret = {"result": "success"}
 
         elif action == "set-admin":

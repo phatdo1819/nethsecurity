@@ -13,7 +13,7 @@
 import os
 import sys
 from euci import EUci
-from nethsec import users
+from nethsec import users, ovpn
 
 # The certificate of a migrated user is not present inside the index.txt
 def is_migrated(instance, user):
@@ -49,7 +49,8 @@ if '@' in cn and is_migrated(instance, os.environ.get("common_name")):
 user = users.get_user_by_name(uci, cn, db)
 
 if user:
-    ipaddr = user.get('openvpn_ipaddr', '')
+    # the reservation is shared between instances, apply it only if the address belongs to this instance
+    ipaddr = ovpn.get_reserved_ip(uci, user, instance)
     if config.get('server'):
         # routed mode
         netmask = config.get('server').split(" ")[1]

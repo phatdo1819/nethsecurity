@@ -138,7 +138,9 @@ def count_hosts():
     return ret
 
 def count_openvpn_rw():
-    return len(ovpn.list_connected_clients('ns_roadwarrior1').keys())
+    # count the clients connected to all the Road Warrior servers
+    u = EUci()
+    return sum(len(ovpn.list_connected_clients(i).keys()) for i in ovpn.list_roadwarrior_instances(u))
 
 def count_threat_shield_ip():
     ret = 0
@@ -204,16 +206,18 @@ def check_ts_ip():
 
 def check_openvpn_rw():
     u = EUci()
-    rw_enabled = u.get("openvpn", "ns_roadwarrior1", "enabled", default="0") == "1"
-    if not rw_enabled:
+    # check all the enabled Road Warrior servers
+    enabled = [i for i in ovpn.list_roadwarrior_instances(u) if u.get("openvpn", i, "enabled", default="0") == "1"]
+    if not enabled:
         return "disabled"
     try:
         pa = subprocess.run(["service", "openvpn", "info"], check=True, capture_output=True)
         info = json.loads(pa.stdout)
-        if info["openvpn"]["instances"]["ns_roadwarrior1"]["running"]:
+        if all(info["openvpn"]["instances"][i]["running"] for i in enabled):
             return "ok"
     except:
-        return "error"
+        pass
+    return "error"
 
 def check_flashstart():
     u = EUci()

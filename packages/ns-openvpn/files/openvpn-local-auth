@@ -14,7 +14,7 @@ import os
 import re
 import sys
 from euci import EUci
-from nethsec import users
+from nethsec import users, ovpn
 
 username = os.environ.get("username")
 password = os.environ.get("password")
@@ -34,8 +34,8 @@ if user is None:
     # user not found
     sys.exit(4)
 
-if not "openvpn_enabled" in user or user["openvpn_enabled"] != "1":
-    # user not enabled
+if not ovpn.is_user_enabled(user, instance):
+    # user not enabled on this instance
     sys.exit(3)
 
 if "password" not in user:

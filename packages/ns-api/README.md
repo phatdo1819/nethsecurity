@@ -1441,6 +1441,25 @@ Response example:
 
 Manage OpenVPN Road Warrior server instances.
 
+Multiple instances can be created. Each instance has its own port, network, certificates (PKI) and
+connection history. The `ns_description` option is the name of the server chosen by the administrator,
+it must be unique and it should be shown instead of the internal instance identifier.
+
+Instances can share the same users database, so users can authenticate with the same user name and
+password on more than one instance. The membership of a user is kept for each instance, using the
+following options inside the `users` database:
+- `openvpn_instances`: list of instances the user belongs to
+- `openvpn_disabled`: list of instances where the user is disabled
+- `openvpn_enabled`: kept for compatibility, it is `1` if the user is enabled on at least one instance
+
+Enabling, disabling, adding and removing a user always affect the given instance only.
+Users without `openvpn_instances` (created by older releases) belong to all the instances using their database;
+they are converted at the first boot after the upgrade.
+
+The following options are shared between all the instances of a user:
+- `openvpn_2fa`: the OTP secret
+- `openvpn_ipaddr`: the reserved IP address, applied only on the instance whose network contains it
+
 ### list-instances
 
 List existing instances:
@@ -1452,16 +1471,27 @@ Response example:
 ```json
 {
   "instances": [
-    "ns_roadwarrior1"
+    "ns_roadwarrior1",
+    "ns_roadwarrior2"
+  ],
+  "details": [
+    {"instance": "ns_roadwarrior1", "description": "Employees", "enabled": "1", "user_db": "main"},
+    {"instance": "ns_roadwarrior2", "description": "Contractors", "enabled": "1", "user_db": "main"}
   ]
 }
 ```
+
+`description` is empty for an instance that has not been configured yet.
+
 ### add-instance
 
 Create a new instance:
 ```
 api-cli ns.ovpnrw add-instance
 ```
+
+The instance number is the lowest one not already used, so removing an instance never prevents creating a new one.
+The first instance uses port `1194`, the others a random port between `1300` and `1400`.
 
 Response example:
 ```json
@@ -1470,9 +1500,12 @@ Response example:
 
 ### remove-instance
 
+Remove an instance, its certificates and its users membership:
 ```
 api-cli ns.ovpnrw remove-instance --data '{"instance": "ns_roadwarrior2"}'
 ```
+
+Users belonging to other instances keep their OpenVPN configuration.
 
 Response example:
 ```json
@@ -1727,6 +1760,11 @@ Response example:
 
 ### set-configuration
 
+The API can raise the following validation errors, in addition to the ones related to the single fields:
+- `description_already_used` (`ns_description`): another instance has the same name
+- `port_already_used` (`port`): another server is using the same port and protocol
+- `network_already_used` (`server`): the network overlaps the one of another server
+
 Configure a routed server:
 ```
 api-cli ns.ovpnrw set-configuration --data '{"instance": "ns_roadwarrior1", "proto":"udp","port":"1194","dev_type":"tun","topology":"subnet","enabled":"1","client_to_client":"0","auth":"SHA256","cipher":"AES-256-GCM","tls_version_min":"1.2","ns_auth_mode":"certificate","ns_public_ip":["192.168.100.238"],"server":"192.168.101.0/24","ns_redirect_gateway":"0","ns_local":["192.168.22.0/24","192.168.100.0/24"],"ns_dhcp_options":[{"option": "NBDD", "value": "1.2.3.4"}],"ns_pool_start":"","ns_pool_end":"","ns_bridge":"", "ns_description": "Road Warrior 1", "ns_user_db": "main"}'
@@ -1787,10 +1825,13 @@ Response example:
 {"result": "success"}
 ```
 
+If the user already belongs to another instance, the existing 2FA secret and reserved IP are kept.
+
 The APIs can raise the following validation errors:
 - user_add_failed
 - reserved_ip_must_be_in_server_network
 - reserverd_ip_already_used
+- reserved_ip_set_for_other_instance: the user already has a reserved IP, which belongs to another instance
 - reserved_ip_must_be_in_server_network
 - user_db_not_configured
 - db_not_found
@@ -1809,11 +1850,14 @@ Response example:
 ```
 
 The APIs can raise the following validation errors:
-- user_not_found
+- user_not_found: the user does not belong to the instance
 - user_add_failed
 - reserved_ip_must_be_in_server_network
 - reserverd_ip_already_used
+- reserved_ip_set_for_other_instance
 - reserved_ip_must_be_in_server_network
+
+The reserved IP is removed only if it belongs to the network of the given instance.
 
 ### disconnect-user
 
@@ -1836,6 +1880,7 @@ Disable an existing user:
 api-cli ns.ovpnrw disable-user --data '{"instance": "ns_roadwarrior1", "username": "myuser"}''
 ```
 If the user is currently utilizing the VPN, the API will also disconnect the client.
+The user is disabled only on the given instance.
 
 Response example:
 ```json
@@ -1861,10 +1906,13 @@ Throws a validation error if the user is not found.
 
 ### delete-user
 
-Delete an existing user:
+Delete an existing user from an instance and revoke its certificate:
 ```
 api-cli ns.ovpnrw delete-user --data '{"instance": "ns_roadwarrior1", "username": "myuser"}''
 ```
+
+The user is not deleted from the users database. The 2FA secret and the reserved IP are removed only
+if the user does not belong to any other instance.
 
 Response example:
 ```json
@@ -1947,15 +1995,28 @@ Output the users connection history in a json format:
 api-cli ns.ovpnrw connection-history --data '{"instance": "ns_roadwarrior1"}'
 ```
 
+If `instance` is omitted or empty, the history of all the servers is returned. In this case the optional
+`instances` parameter (list of instance identifiers) restricts the servers included in the result.
+Other optional parameters: `q`, `start_time`, `accounts`, `page`, `per_page`, `sort_by` and `desc`.
+`sort_by` can be `account`, `instance`, `startTime`, `endTime`, `duration`, `virtualIpAddress` or `remoteIpAddress`.
+
 Response example:
 ```json
 {
-  [
-    {"account": "foo", "bytesReceived": null, "bytesSent": null, "duration": null, "endTime": null, "remoteIpAddress": "12.34.56.78", "startTime": 1729592489, "virtualIpAddress": "10.9.9.41"}, 
-    {"account": "john", "bytesReceived": 9605402, "bytesSent": 33898343, "duration": 968, "endTime": 1729516942, "remoteIpAddress": "12.34.56.78", "startTime": 1729515974, "virtualIpAddress": "10.9.9.41"}
-  ]
+  "connections": [
+    {"instance": "ns_roadwarrior1", "account": "foo", "bytesReceived": null, "bytesSent": null, "duration": null, "endTime": null, "remoteIpAddress": "12.34.56.78", "startTime": 1729592489, "virtualIpAddress": "10.9.9.41"},
+    {"instance": "ns_roadwarrior2", "account": "john", "bytesReceived": 9605402, "bytesSent": 33898343, "duration": 968, "endTime": 1729516942, "remoteIpAddress": "12.34.56.78", "startTime": 1729515974, "virtualIpAddress": "10.8.8.41"}
+  ],
+  "current_page": 1,
+  "last_page": 1,
+  "per_page": 10,
+  "total": 2,
+  "results": 2,
+  "filters": {"accounts": ["foo", "john"], "instances": ["ns_roadwarrior1", "ns_roadwarrior2"]}
 }
 ```
+
+`filters.instances` lists the servers with a history database. In the aggregated history, servers without a history are skipped.
 
 Throws a generic error:
 - the sqlite database is not found
@@ -1968,6 +2029,9 @@ Download the users connection history in a csv file:
 api-cli ns.ovpnrw connection-history-csv --data '{"instance": "ns_roadwarrior1", "timezone":"Europe/Rome"}'
 ```
 
+- `instance`: optional, if omitted or empty the history of all the servers is exported and a `Server` column is added
+  as first column, it contains the server name chosen by the administrator
+- `instances`: optional list of instance identifiers, restricts the servers included in the export when `instance` is empty
 - `timezone`: user timezone, e.g. "Europe/Rome"
 
 Response example:
@@ -6009,6 +6073,10 @@ May raise the following validation errors:
 - user_not_found
 - db_not_local
 
+If the user belongs to OpenVPN Road Warrior servers, it is disconnected from all of them and its certificates
+are revoked. Revocation is immediate: it happens before the changes are committed and is not undone by a revert.
+The deletion succeeds even if a revocation fails, the error is logged.
+
 ### add-remote-user
 
 Add a user to the remote database:
@@ -6062,6 +6130,9 @@ Response example:
 May raise the following validation errors:
 - user_not_found
 - db_not_remote
+
+As for `delete-local-user`, the user is disconnected from all the OpenVPN Road Warrior servers and its
+certificates are revoked.
 
 ### set-admin
 

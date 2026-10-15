@@ -1,0 +1,20 @@
+#!/bin/sh
+
+#
+# Copyright (C) 2026 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-2.0-only
+#
+
+# Convert legacy Road Warrior users to explicit per-instance membership (openvpn_instances).
+# Each legacy user is added to all the instances using its user database, so access
+# does not change after the upgrade.
+# uci-defaults scripts are sourced by sh, so the Python code is passed to the interpreter.
+
+python3 - <<'EOF'
+from euci import EUci
+from nethsec import ovpn
+
+u = EUci()
+if ovpn.migrate_user_memberships(u) > 0:
+    u.commit("users")
+EOF

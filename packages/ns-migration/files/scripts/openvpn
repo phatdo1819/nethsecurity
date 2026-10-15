@@ -191,6 +191,9 @@ for user in data["users"]:
     u.set("users", sname, "database", user_db)
     u.set("users", sname, "openvpn_ipaddr", user["ipaddr"])
     u.set("users", sname, "openvpn_enabled", user["enabled"])
+    u.set("users", sname, "openvpn_instances", [iname])
+    if str(user["enabled"]) != "1":
+        u.set("users", sname, "openvpn_disabled", [iname])
     if 'password' in user and user.get('password'):
         u.set("users", sname, "password", user["password"])
     if '2fa' in user and user.get('2fa'):
