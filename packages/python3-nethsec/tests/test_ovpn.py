@@ -128,7 +128,10 @@ config user 'ns_new'
 def _setup_rw(tmp_path):
     tmp_path.joinpath('openvpn').write_text(rw_db)
     tmp_path.joinpath('users').write_text(users_db)
-    return EUci(confdir=tmp_path.as_posix())
+    # a dedicated savedir, otherwise the saved changes leak into the next tests
+    save_dir = tmp_path.joinpath('.save')
+    save_dir.mkdir()
+    return EUci(confdir=tmp_path.as_posix(), savedir=save_dir.as_posix())
 
 def _user(u, user_id):
     ret = {opt: u.get_all('users', user_id, opt) for opt in u.get_all('users', user_id)}
