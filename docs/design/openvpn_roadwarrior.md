@@ -24,6 +24,26 @@ The instance number `<N>` is the lowest one not in use, so it can be reused afte
 
 The `rwopenvpn` trusted firewall zone is shared by all the instances.
 
+## Traffic between instances
+
+The `rwopenvpn` zone rejects the traffic inside the zone, so by default the clients of an instance can't reach
+the clients of another instance. The `ns_inter_server` option of an instance (`0` by default) allows it.
+The traffic is allowed between two instances only if both have the option enabled, and only routed (`tun`)
+instances take part: `tap` instances are bridged to a LAN.
+
+`nethsec.ovpn.sync_inter_server_traffic` applies the option of all the instances at once. `ns.ovpnrw` calls it
+after `set-configuration` and `remove-instance`, because changing one instance (option, network, device type)
+changes the configuration of the others. For each enabled instance it maintains:
+
+- the pushed routes to the networks of the other enabled instances: they are listed also in the
+  `ns_inter_server_route` option, so they are told apart from the local networks chosen by the administrator
+- the firewall rule `<instance>_inter_server` (`ns_tag 'automated'`, linked to the instance), accepting the traffic
+  from the instance network to the networks of the other enabled instances; the return traffic is accepted
+  as established
+
+The traffic between the clients of the same instance is not affected, it is controlled by `client_to_client`.
+Clients get the new routes when they reconnect: changing the pushed routes restarts the OpenVPN instance on commit.
+
 ## Users
 
 Each instance uses a users database (`ns_user_db`). Two or more instances can use the same database, so

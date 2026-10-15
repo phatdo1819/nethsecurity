@@ -595,6 +595,144 @@ def get_instance_network(uci, instance):
         return None
 
 
+# Traffic between Road Warrior instances
+#
+# All the instances share the rwopenvpn zone, which rejects the traffic inside the zone:
+# by default the clients of an instance can't reach the clients of another instance.
+# When the ns_inter_server option is enabled on two or more tun instances, each of them gets:
+#
+#   - a pushed route for the network of every other enabled instance; the routes added this way
+#     are listed in the ns_inter_server_route option, so they are not mistaken for local networks
+#   - a firewall rule (<instance>_inter_server) accepting the traffic from its network to the
+#     networks of the other enabled instances
+#
+# The traffic between the clients of the same instance is not affected (see client_to_client).
+
+INTER_SERVER_ZONE = 'rwopenvpn'
+
+
+def _delete(uci, config, section, option):
+    try:
+        uci.delete(config, section, option)
+    except:
+        pass
+
+
+def _set_if_changed(uci, config, section, option, value):
+    if isinstance(value, list):
+        current = _as_list(uci.get(config, section, option, list=True, default=None))
+    else:
+        current = uci.get(config, section, option, default=None)
+    if current != value:
+        uci.set(config, section, option, value)
+
+
+def is_inter_server_enabled(uci, instance):
+    """
+    Check if the clients of an instance can talk to the clients of the other Road Warrior instances.
+
+    Arguments:
+      - uci -- EUci instance
+      - instance -- OpenVPN instance name
+
+    Returns:
+      - True if the ns_inter_server option is enabled and the instance uses a tun device
+    """
+    if uci.get('openvpn', instance, 'ns_inter_server', default='0') != '1':
+        return False
+    return uci.get('openvpn', instance, 'dev_type', default='tun') == 'tun'
+
+
+def get_inter_server_routes(uci, instance):
+    """
+    Return the push options added to an instance by sync_inter_server_traffic().
+
+    Arguments:
+      - uci -- EUci instance
+      - instance -- OpenVPN instance name
+
+    Returns:
+      - a list of push options, like 'route 10.20.0.0 255.255.255.0'
+    """
+    return _as_list(uci.get('openvpn', instance, 'ns_inter_server_route', list=True, default=None))
+
+
+def get_inter_server_rule(instance):
+    """
+    Return the name of the firewall rule accepting the traffic from an instance to the other instances.
+
+    Arguments:
+      - instance -- OpenVPN instance name
+
+    Returns:
+      - the firewall section name
+    """
+    return f"{instance}_inter_server"
+
+
+def sync_inter_server_traffic(uci):
+    """
+    Apply the ns_inter_server option of all the Road Warrior instances: update the routes pushed
+    to the clients and the firewall rules. Call it after changing the option, the network or the
+    device type of an instance, and after removing an instance.
+    The changes are saved, not committed.
+
+    Arguments:
+      - uci -- EUci instance
+
+    Returns:
+      - the list of instances whose pushed routes changed: their clients get the new routes when they reconnect
+    """
+    instances = list_roadwarrior_instances(uci)
+    networks = {}
+    for instance in instances:
+        if is_inter_server_enabled(uci, instance):
+            network = get_instance_network(uci, instance)
+            if network:
+                networks[instance] = network
+
+    changed = []
+    for instance in instances:
+        others = [n for i, n in networks.items() if i != instance] if instance in networks else []
+
+        managed = get_inter_server_routes(uci, instance)
+        current = _as_list(uci.get('openvpn', instance, 'push', list=True, default=None))
+        routes = [f"route {n.network_address} {n.netmask}" for n in others]
+        push = [p for p in current if p not in managed] + routes
+        if push != current:
+            changed.append(instance)
+            if push:
+                uci.set('openvpn', instance, 'push', push)
+            else:
+                _delete(uci, 'openvpn', instance, 'push')
+        if routes:
+            _set_if_changed(uci, 'openvpn', instance, 'ns_inter_server_route', routes)
+        elif managed:
+            _delete(uci, 'openvpn', instance, 'ns_inter_server_route')
+
+        rule = get_inter_server_rule(instance)
+        if others:
+            number = re.search(r"\d+$", instance)
+            if uci.get('firewall', rule, default=None) is None:
+                uci.set('firewall', rule, 'rule')
+            _set_if_changed(uci, 'firewall', rule, 'name', f"Allow-OpenVPNRW{number.group() if number else ''}-inter-server")
+            _set_if_changed(uci, 'firewall', rule, 'src', INTER_SERVER_ZONE)
+            _set_if_changed(uci, 'firewall', rule, 'dest', INTER_SERVER_ZONE)
+            _set_if_changed(uci, 'firewall', rule, 'src_ip', [str(networks[instance])])
+            _set_if_changed(uci, 'firewall', rule, 'dest_ip', [str(n) for n in others])
+            _set_if_changed(uci, 'firewall', rule, 'proto', 'all')
+            _set_if_changed(uci, 'firewall', rule, 'target', 'ACCEPT')
+            _set_if_changed(uci, 'firewall', rule, 'enabled', '1')
+            _set_if_changed(uci, 'firewall', rule, 'ns_tag', ['automated'])
+            _set_if_changed(uci, 'firewall', rule, 'ns_link', f"openvpn/{instance}")
+        elif uci.get('firewall', rule, default=None) is not None:
+            uci.delete('firewall', rule)
+
+    uci.save('openvpn')
+    uci.save('firewall')
+    return changed
+
+
 def get_reserved_ip(uci, user, instance):
     """
     Return the IP address reserved for a user on an instance.
