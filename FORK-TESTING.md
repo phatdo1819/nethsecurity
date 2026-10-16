@@ -20,12 +20,25 @@ Only the Road Warrior files are replaced, everything else stays as shipped.
 ## 1. Get the code
 
 ```sh
-git clone -b ci-fork https://github.com/phatdo1819/nethsecurity.git
+git clone https://github.com/phatdo1819/nethsecurity.git
 git clone https://github.com/phatdo1819/nethsecurity-ui.git
 ```
 
-If you already have the clones, update them with `git switch ci-fork` and `git pull`
-inside `nethsecurity`.
+This checks out `feat/ovpnrw-multi-instance`, which holds the changes. The `ci-fork` branch,
+used to build the image, contains the same files: you can copy them from either branch.
+
+If you already have the clones, update **both** of them every time, before building or copying anything:
+
+```sh
+cd nethsecurity
+git pull
+git log -1 --oneline
+cd ..
+```
+
+Compare the commit shown with the latest one on GitHub. Copying the files from an old clone
+is the most common mistake: the new web UI then shows options that the firewall ignores,
+for example a setting that turns itself off again after saving.
 
 ## 2. Build the web UI
 
@@ -113,8 +126,23 @@ To install a newer version of the files, repeat steps 1–4: the backup of the o
    5. the firewall rules page shows a system rule `Allow-OpenVPNRW<N>-inter-server` for each enabled server
       while the traffic is allowed, and none when it is not
 
+   Ping the other client's VPN address, not the address of the other server (`.1`): that one belongs to
+   the firewall, which answers it even without the option.
+
    Windows blocks incoming ping by default: allow it in the Windows firewall of the client you ping, or test
-   with another service, such as a shared folder.
+   with another service, such as a shared folder. Two clients that can ping each other in the office
+   may still not answer each other through the VPN: Windows usually treats the VPN connection as a
+   public network, where ping is blocked, and allows ping only from its own subnet.
+
+   If the ping fails, find where the packets stop. On the firewall, run `tcpdump -ni tunrw<N> icmp` for
+   the server of the client you ping, then ping from the other client:
+
+   - no packets: the firewall does not forward them. Check that both servers have the option on, that the
+     changes are applied and that the two `inter_server` firewall rules exist
+   - only `echo request` packets: the firewall forwards them and the client you ping doesn't answer
+     through the VPN. Check its firewall, and that it has the route to the network of the other server:
+     without it the reply leaves through its normal connection
+   - `echo request` and `echo reply` packets: the firewall delivers both, so check the client you ping from
 8. **Many servers**:
    1. with up to 5 servers each one has a tab; give one a long name: the tab bar scrolls instead of the page
    2. add servers until there are 6: the tab bar shows only "Servers" and "Connection history", and a
