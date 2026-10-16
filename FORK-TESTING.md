@@ -167,7 +167,7 @@ To install a newer version of the files, repeat steps 1–4: the backup of the o
    5. delete servers until there are 5: each server gets its tab back
 9. **DCO** (only with `ns-dco.tar.gz`):
    1. `lsmod | grep ovpn` shows the module, and `ip -d link show tunrw1` shows `ovpn` instead of `tun`
-      for every routed server. `logread -e openvpn | grep -i dco` explains why a server doesn't use it:
+      for every routed server. `grep -i openvpn /var/log/messages | grep -i dco` explains why a server doesn't use it:
       bridged servers, CBC ciphers and compression turn it off
    2. users connect, the connected-users list and the connection history (duration, traffic) work as before
    3. with client-to-client enabled, two clients of the same server can ping each other, and the firewall
@@ -188,7 +188,7 @@ To install a newer version of the files, repeat steps 1–4: the backup of the o
 Useful commands on the firewall:
 
 ```sh
-logread -e openvpn
+grep -i openvpn /var/log/messages | tail -n 30
 api-cli ns.ovpnrw list-instances
 uci show users | grep openvpn_
 uci show openvpn | grep -E 'ns_inter_server|push'
