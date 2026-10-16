@@ -121,7 +121,7 @@ APIs are Python 3 scripts placed at `/usr/libexec/rpcd/ns.<name>` on the device.
 **UCI conventions:**
 - Zones: `ns_<zonename>` (e.g., `ns_lan`, `ns_guest`).
 - Firewall rule IDs: prefix `ns_` (e.g., `ns_206325d3`); system rules flagged `system_rule: true`.
-- OpenVPN Road Warrior: multiple instances (`ns_roadwarrior<N>`) can share a users database. Per-instance user state lives in `users` options `openvpn_instances` / `openvpn_disabled`; never read `openvpn_enabled` directly, use `nethsec.ovpn.is_user_enabled()` / `get_reserved_ip()`. See [`docs/design/openvpn_roadwarrior.md`](docs/design/openvpn_roadwarrior.md).
+- OpenVPN Road Warrior: multiple instances (`ns_roadwarrior<N>`) can share a users database. Per-instance user state lives in `users` options `openvpn_instances` / `openvpn_disabled`; never read `openvpn_enabled` directly, use `nethsec.ovpn.is_user_enabled()` / `get_reserved_ip()`. OpenVPN uses data channel offload (DCO): traffic between clients goes through the firewall, so `client_to_client` needs the rule kept by `nethsec.ovpn.sync_client_to_client_traffic()`. See [`docs/design/openvpn_roadwarrior.md`](docs/design/openvpn_roadwarrior.md).
 
 ---
 

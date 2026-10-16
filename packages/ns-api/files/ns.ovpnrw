@@ -672,6 +672,8 @@ def set_configuration(args):
     u.save("openvpn")
     # the network or the device type may have changed: update the other instances too
     ovpn.sync_inter_server_traffic(u)
+    # with data channel offload the traffic between the clients goes through the firewall
+    ovpn.sync_client_to_client_traffic(u)
 
     return {"result": "success"}
 

@@ -402,3 +402,39 @@ def test_sync_inter_server_traffic_tap_and_removed(tmp_path):
     ovpn.sync_inter_server_traffic(u)
     assert _push(u, 'ns_roadwarrior1') == []
     assert u.get('firewall', ovpn.get_inter_server_rule('ns_roadwarrior1'), default=None) is None
+def test_sync_client_to_client_traffic(tmp_path):
+    u = _setup_rw(tmp_path)
+    tmp_path.joinpath('firewall').write_text('')
+    rule1 = ovpn.get_client_to_client_rule('ns_roadwarrior1')
+    rule3 = ovpn.get_client_to_client_rule('ns_roadwarrior3')
+
+    # the option is off by default: no rules
+    assert ovpn.sync_client_to_client_traffic(u) == []
+    assert u.get('firewall', rule1, default=None) is None
+
+    # the traffic from the instance network to itself is accepted
+    u.set('openvpn', 'ns_roadwarrior1', 'client_to_client', '1')
+    assert ovpn.sync_client_to_client_traffic(u) == ['ns_roadwarrior1']
+    assert u.get('firewall', rule1, 'name') == 'Allow-OpenVPNRW1-client-to-client'
+    assert u.get('firewall', rule1, 'src') == 'rwopenvpn'
+    assert u.get('firewall', rule1, 'dest') == 'rwopenvpn'
+    assert list(u.get('firewall', rule1, 'src_ip', list=True)) == ['10.20.0.0/24']
+    assert list(u.get('firewall', rule1, 'dest_ip', list=True)) == ['10.20.0.0/24']
+    assert u.get('firewall', rule1, 'target') == 'ACCEPT'
+    assert u.get('firewall', rule1, 'ns_link') == 'openvpn/ns_roadwarrior1'
+    assert u.get('firewall', rule3, default=None) is None
+    # nothing to change
+    assert ovpn.sync_client_to_client_traffic(u) == []
+
+    # a new network updates the rule
+    u.set('openvpn', 'ns_roadwarrior1', 'server', '10.21.0.0 255.255.255.0 nopool')
+    assert ovpn.sync_client_to_client_traffic(u) == ['ns_roadwarrior1']
+    assert list(u.get('firewall', rule1, 'dest_ip', list=True)) == ['10.21.0.0/24']
+
+    # tap instances don't use DCO, turning the option off removes the rule
+    u.set('openvpn', 'ns_roadwarrior3', 'client_to_client', '1')
+    u.set('openvpn', 'ns_roadwarrior3', 'dev_type', 'tap')
+    u.set('openvpn', 'ns_roadwarrior1', 'client_to_client', '0')
+    assert ovpn.sync_client_to_client_traffic(u) == ['ns_roadwarrior1']
+    assert u.get('firewall', rule1, default=None) is None
+    assert u.get('firewall', rule3, default=None) is None
