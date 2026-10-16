@@ -1,0 +1,19 @@
+#!/bin/sh
+
+#
+# Copyright (C) 2026 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-2.0-only
+#
+
+# Accept the traffic between the clients of the Road Warrior instances with client_to_client enabled.
+# With data channel offload (DCO) it goes through the firewall, which rejects it by default.
+# uci-defaults scripts are sourced by sh, so the Python code is passed to the interpreter.
+
+python3 - <<'EOF'
+from euci import EUci
+from nethsec import ovpn
+
+u = EUci()
+if ovpn.sync_client_to_client_traffic(u):
+    u.commit("firewall")
+EOF

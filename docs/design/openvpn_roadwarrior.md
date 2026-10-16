@@ -41,8 +41,33 @@ changes the configuration of the others. For each enabled instance it maintains:
   from the instance network to the networks of the other enabled instances; the return traffic is accepted
   as established
 
-The traffic between the clients of the same instance is not affected, it is controlled by `client_to_client`.
+The traffic between the clients of the same instance is not affected, it is controlled by `client_to_client`
+(see [Data channel offload](#data-channel-offload)).
 Clients get the new routes when they reconnect: changing the pushed routes restarts the OpenVPN instance on commit.
+
+## Data channel offload
+
+OpenVPN is built with data channel offload (DCO, `CONFIG_OPENVPN_openssl_ENABLE_DCO`): the `ovpn` kernel module
+(`kmod-ovpn-backports`) encrypts and forwards the VPN traffic, while the `openvpn` process handles only the
+connections. The kernel spreads the traffic of the clients over all the CPU cores, instead of the single core of
+the `openvpn` process.
+
+OpenVPN uses DCO automatically when the configuration allows it and falls back to the userspace data channel
+otherwise, logging the reason. DCO needs:
+
+- a routed (`tun`) instance: bridged (`tap`) instances never use it
+- an AEAD cipher (AES-GCM or ChaCha20-Poly1305): the default `auto` cipher is fine, a CBC cipher disables DCO
+- no compression
+
+OpenWrt's `disable_dco` option turns it off for an instance.
+
+With DCO, OpenVPN does not forward the traffic between two clients of the same instance itself
+(`client_to_client`): the kernel routes it back to the tunnel device, through the firewall, where the `rwopenvpn`
+zone rejects it. `nethsec.ovpn.sync_client_to_client_traffic` keeps the firewall rule
+`<instance>_client_to_client` (`ns_tag 'automated'`, linked to the instance) for every routed instance with
+`client_to_client` enabled, accepting the traffic from the instance network to itself. Without DCO the rule
+is not used. `ns.ovpnrw` calls it after `set-configuration`, and `99_ns-openvpn-client-to-client` creates
+the rules for the existing instances at first boot.
 
 ## Users
 

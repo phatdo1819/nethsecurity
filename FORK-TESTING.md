@@ -11,6 +11,10 @@ It works on:
 
 Only the Road Warrior files are replaced, everything else stays as shipped.
 
+Optionally, it also installs OpenVPN with data channel offload (DCO), which moves the VPN traffic into
+the kernel and uses all the CPU cores. Those files must be built on a x86_64 Linux machine first, see
+[Build on Ubuntu](#build-on-ubuntu). The same section explains how to build a full image with all the changes.
+
 ## What you need
 
 - `root` SSH access to the firewall
@@ -80,11 +84,17 @@ The rest is the same in both shells:
 
 ```sh
 ssh $FW "rm -rf /tmp/ns-test && mkdir -p /tmp/ns-test"
-scp nethsecurity/tools/fork-test/install-on-device.sh nethsecurity/packages/python3-nethsec/src/nethsec/ovpn/__init__.py nethsecurity/packages/ns-api/files/ns.ovpnrw nethsecurity/packages/ns-api/files/ns.users nethsecurity/packages/ns-api/files/ns.dashboard nethsecurity/packages/ns-openvpn/files/openvpn-local-auth nethsecurity/packages/ns-openvpn/files/openvpn-remote-auth nethsecurity/packages/ns-openvpn/files/openvpn-otp-auth nethsecurity/packages/ns-openvpn/files/01-check-status nethsecurity/packages/ns-openvpn/files/10-static-lease nethsecurity/packages/ns-openvpn/files/80-save-connection nethsecurity/packages/ns-openvpn/files/99_ns-openvpn-user-instances "${FW}:/tmp/ns-test/"
+scp nethsecurity/tools/fork-test/install-on-device.sh nethsecurity/packages/python3-nethsec/src/nethsec/ovpn/__init__.py nethsecurity/packages/ns-api/files/ns.ovpnrw nethsecurity/packages/ns-api/files/ns.users nethsecurity/packages/ns-api/files/ns.dashboard nethsecurity/packages/ns-openvpn/files/openvpn-local-auth nethsecurity/packages/ns-openvpn/files/openvpn-remote-auth nethsecurity/packages/ns-openvpn/files/openvpn-otp-auth nethsecurity/packages/ns-openvpn/files/01-check-status nethsecurity/packages/ns-openvpn/files/10-static-lease nethsecurity/packages/ns-openvpn/files/80-save-connection nethsecurity/packages/ns-openvpn/files/99_ns-openvpn-user-instances nethsecurity/packages/ns-openvpn/files/99_ns-openvpn-client-to-client "${FW}:/tmp/ns-test/"
 scp -r nethsecurity-ui/dist "${FW}:/tmp/ns-test/ui"
 ```
 
 Skip the last command if you don't want to update the web UI.
+
+To install DCO too, copy the archive built on Ubuntu with this exact name:
+
+```sh
+scp ns-dco-8.8.0.tar.gz "${FW}:/tmp/ns-test/ns-dco.tar.gz"
+```
 
 ## 4. Install
 
@@ -98,8 +108,12 @@ The script:
 2. installs the new files
 3. converts the existing Road Warrior users to per-instance membership, as the first boot of a new
    image does; `/etc/config/users` is saved first
-4. installs the web UI, keeping the device branding
-5. restarts `rpcd`
+4. adds a firewall rule for each routed server with client-to-client enabled: with DCO that traffic
+   goes through the firewall
+5. installs the web UI, keeping the device branding
+6. restarts `rpcd`
+7. only with `ns-dco.tar.gz`: checks that the files match the kernel of the firewall, installs the new
+   `openvpn` program and the `ovpn` kernel module, and restarts OpenVPN. The clients reconnect
 
 Reload the web UI with Ctrl+F5.
 
@@ -151,6 +165,25 @@ To install a newer version of the files, repeat steps 1–4: the backup of the o
    4. with more than 10 servers having connections, the "all servers" history and the CSV export include
       every server, and filtering on any single server shows its connections
    5. delete servers until there are 5: each server gets its tab back
+9. **DCO** (only with `ns-dco.tar.gz`):
+   1. `lsmod | grep ovpn` shows the module, and `ip -d link show tunrw1` shows `ovpn` instead of `tun`
+      for every routed server. `logread -e openvpn | grep -i dco` explains why a server doesn't use it:
+      bridged servers, CBC ciphers and compression turn it off
+   2. users connect, the connected-users list and the connection history (duration, traffic) work as before
+   3. with client-to-client enabled, two clients of the same server can ping each other, and the firewall
+      rules page shows a system rule `Allow-OpenVPNRW<N>-client-to-client`
+   4. traffic between servers (test 7) still works
+   5. speed: run `iperf3` between a client and a LAN host, or between two clients, and compare with DCO off.
+      To turn it off on one server:
+
+      ```sh
+      uci set openvpn.ns_roadwarrior1.disable_dco=1
+      uci commit openvpn
+      /etc/init.d/openvpn restart
+      ```
+
+      Remove it with `uci delete openvpn.ns_roadwarrior1.disable_dco`, then commit and restart again.
+      Without DCO one `openvpn` process uses at most one CPU core: watch it in `top`
 
 Useful commands on the firewall:
 
@@ -159,8 +192,9 @@ logread -e openvpn
 api-cli ns.ovpnrw list-instances
 uci show users | grep openvpn_
 uci show openvpn | grep -E 'ns_inter_server|push'
-uci show firewall | grep inter_server
+uci show firewall | grep -E 'inter_server|client_to_client'
 ip route
+openvpn --version | head -n 1
 ```
 
 On a client, `route print` (Windows) or `ip route` (Linux) shows the routes received from the server.
@@ -174,9 +208,66 @@ changes: the original files don't know the option, so they would leave its route
 ssh $FW "sh /root/ns-test-backup/install-on-device.sh --restore"
 ```
 
-This puts back the original files and the original web UI. The users configuration is not restored, because
+This puts back the original files and the original web UI. With DCO installed, it also puts back the original
+`openvpn` program, restarts OpenVPN and unloads the module. The users configuration is not restored, because
 it may contain users you added during the test; the version from before the first install is
 `/root/ns-test-backup/users.config`. The older code keeps working with the converted users.
+The client-to-client firewall rules stay: without DCO they are not used.
+
+## Build on Ubuntu
+
+The NethSecurity builder runs on a x86_64 Linux machine, Ubuntu 24.04 for example, also as a virtual
+machine. Give it at least 4 CPU cores, 8 GB of RAM (16 GB is better) and 100 GB of free disk space.
+The first build downloads and compiles the toolchain and takes a while; the build directories are kept
+in podman volumes, so the next builds only compile what changed.
+
+Install the tools, as a normal user (not root):
+
+```sh
+sudo apt update
+sudo apt install -y git curl python3 podman
+podman info > /dev/null && echo "podman works"
+```
+
+### DCO files for an official release
+
+This builds only the kernel, OpenVPN with DCO and the `ovpn` kernel module of the official 8.8.0,
+about one hour the first time on 4 cores:
+
+```sh
+git clone https://github.com/phatdo1819/nethsecurity.git
+cd nethsecurity
+tools/fork-test/build-dco.sh 8.8.0
+```
+
+The result is `ns-dco-8.8.0.tar.gz`. Copy it with step 3 and install it with step 4.
+
+The script builds the sources of the official release, not of this branch, and stops if the kernel built
+does not match the official one: the module only loads on the kernel it was built for. For the same reason
+the archive fits only that release, so build it again after a system update. The install script skips
+it on a different kernel.
+
+### Full image with all the changes
+
+The `ci-fork` branch builds the whole image, web UI included, with DCO:
+
+```sh
+git clone -b ci-fork https://github.com/phatdo1819/nethsecurity.git nethsecurity-image
+cd nethsecurity-image
+./build-nethsec.sh
+```
+
+The first build takes a few hours. Afterwards, `git pull` and `./build-nethsec.sh` rebuild only the
+changed packages. The image is `bin/targets/x86/64/nethsecurity-*-combined-efi.img.gz`. Install it on the
+test firewall keeping the configuration:
+
+```sh
+scp bin/targets/x86/64/nethsecurity-*-combined-efi.img.gz root@192.168.1.1:/tmp/
+ssh root@192.168.1.1 "sysupgrade -v /tmp/nethsecurity-*-combined-efi.img.gz"
+```
+
+The image is built from the development branch of NethSecurity, newer than 8.8.0: use it only on a test
+firewall. To go back, install the official image the same way.
 
 ## Known limitations
 
@@ -185,3 +276,6 @@ it may contain users you added during the test; the version from before the firs
 - Installing a system or package update replaces some of these files with the official version.
   Repeat steps 3 and 4 afterwards, or restore first.
 - A reboot does not undo the files, they stay installed.
+- The DCO files are built from the official sources with one change: the `ovpn` module contains its own copy
+  of the kernel stream parser (used by TCP servers), because the official kernel doesn't have it.
+  A full image built from `ci-fork` uses the kernel's one instead.

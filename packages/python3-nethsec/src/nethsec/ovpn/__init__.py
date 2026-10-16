@@ -606,7 +606,8 @@ def get_instance_network(uci, instance):
 #   - a firewall rule (<instance>_inter_server) accepting the traffic from its network to the
 #     networks of the other enabled instances
 #
-# The traffic between the clients of the same instance is not affected (see client_to_client).
+# The traffic between the clients of the same instance is not affected (see client_to_client and
+# sync_client_to_client_traffic).
 
 INTER_SERVER_ZONE = 'rwopenvpn'
 
@@ -712,23 +713,77 @@ def sync_inter_server_traffic(uci):
 
         rule = get_inter_server_rule(instance)
         if others:
-            number = re.search(r"\d+$", instance)
-            if uci.get('firewall', rule, default=None) is None:
-                uci.set('firewall', rule, 'rule')
-            _set_if_changed(uci, 'firewall', rule, 'name', f"Allow-OpenVPNRW{number.group() if number else ''}-inter-server")
-            _set_if_changed(uci, 'firewall', rule, 'src', INTER_SERVER_ZONE)
-            _set_if_changed(uci, 'firewall', rule, 'dest', INTER_SERVER_ZONE)
-            _set_if_changed(uci, 'firewall', rule, 'src_ip', [str(networks[instance])])
-            _set_if_changed(uci, 'firewall', rule, 'dest_ip', [str(n) for n in others])
-            _set_if_changed(uci, 'firewall', rule, 'proto', 'all')
-            _set_if_changed(uci, 'firewall', rule, 'target', 'ACCEPT')
-            _set_if_changed(uci, 'firewall', rule, 'enabled', '1')
-            _set_if_changed(uci, 'firewall', rule, 'ns_tag', ['automated'])
-            _set_if_changed(uci, 'firewall', rule, 'ns_link', f"openvpn/{instance}")
+            _set_instance_rule(uci, rule, instance, 'inter-server', networks[instance], others)
         elif uci.get('firewall', rule, default=None) is not None:
             uci.delete('firewall', rule)
 
     uci.save('openvpn')
+    uci.save('firewall')
+    return changed
+
+
+def _set_instance_rule(uci, rule, instance, suffix, network, destinations):
+    # create or update a firewall rule accepting the traffic from the network of an instance
+    number = re.search(r"\d+$", instance)
+    if uci.get('firewall', rule, default=None) is None:
+        uci.set('firewall', rule, 'rule')
+    _set_if_changed(uci, 'firewall', rule, 'name', f"Allow-OpenVPNRW{number.group() if number else ''}-{suffix}")
+    _set_if_changed(uci, 'firewall', rule, 'src', INTER_SERVER_ZONE)
+    _set_if_changed(uci, 'firewall', rule, 'dest', INTER_SERVER_ZONE)
+    _set_if_changed(uci, 'firewall', rule, 'src_ip', [str(network)])
+    _set_if_changed(uci, 'firewall', rule, 'dest_ip', [str(n) for n in destinations])
+    _set_if_changed(uci, 'firewall', rule, 'proto', 'all')
+    _set_if_changed(uci, 'firewall', rule, 'target', 'ACCEPT')
+    _set_if_changed(uci, 'firewall', rule, 'enabled', '1')
+    _set_if_changed(uci, 'firewall', rule, 'ns_tag', ['automated'])
+    _set_if_changed(uci, 'firewall', rule, 'ns_link', f"openvpn/{instance}")
+
+
+def get_client_to_client_rule(instance):
+    """
+    Return the name of the firewall rule accepting the traffic between the clients of an instance.
+
+    Arguments:
+      - instance -- OpenVPN instance name
+
+    Returns:
+      - the firewall section name
+    """
+    return f"{instance}_client_to_client"
+
+
+def sync_client_to_client_traffic(uci):
+    """
+    Create the firewall rules for the client_to_client option of the Road Warrior instances.
+    With data channel offload (DCO) the kernel module, not OpenVPN, forwards the traffic between
+    two clients of the same instance: it goes through the firewall, where the rwopenvpn zone rejects it.
+    Without DCO the rules are not used. Bridged (tap) instances don't use DCO and get no rule.
+    Call it after changing the option, the network or the device type of an instance.
+    The changes are saved, not committed.
+
+    Arguments:
+      - uci -- EUci instance
+
+    Returns:
+      - the list of instances whose rule was created, changed or removed
+    """
+    changed = []
+    for instance in list_roadwarrior_instances(uci):
+        rule = get_client_to_client_rule(instance)
+        exists = uci.get('firewall', rule, default=None) is not None
+        network = None
+        if uci.get('openvpn', instance, 'client_to_client', default='0') == '1' and \
+                uci.get('openvpn', instance, 'dev_type', default='tun') == 'tun':
+            network = get_instance_network(uci, instance)
+        if network:
+            before = uci.get_all('firewall', rule) if exists else None
+            _set_instance_rule(uci, rule, instance, 'client-to-client', network, [network])
+            if before != uci.get_all('firewall', rule):
+                changed.append(instance)
+        elif exists:
+            uci.delete('firewall', rule)
+            changed.append(instance)
+
     uci.save('firewall')
     return changed
 
