@@ -189,8 +189,15 @@ To install a newer version of the files, repeat steps 1–4: the backup of the o
       `tools/fork-test/vpn-traffic.sh` shows which servers use DCO, the live traffic of each server and of the
       WAN, and the load of each CPU core. Copy it to the firewall and run `sh vpn-traffic.sh` during a test.
       A single core near 100% softirq while the others are idle means the network card delivers all the
-      packets to one core: try OpenWrt's packet steering (`uci set network.globals.packet_steering='1'`,
-      `uci commit network`, `/etc/init.d/packet_steering reload`)
+      packets to one core: OpenWrt's packet steering spreads them. `cat /sys/class/net/eth0/queues/rx-0/rps_cpus`
+      shows `0` when it is off. To turn it on (`2` uses every core, `0` turns it off):
+
+      ```sh
+      uci -q get network.@globals[0] > /dev/null || uci add network globals
+      uci set network.@globals[0].packet_steering='1'
+      uci commit network
+      /etc/init.d/packet_steering reload
+      ```
 
 Useful commands on the firewall:
 
