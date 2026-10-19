@@ -14,6 +14,10 @@
 
 INTERVAL=${1:-2}
 WAN=${2:-$(ip route show default | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')}
+if [ -z "$WAN" ] || [ ! -d "/sys/class/net/$WAN" ]; then
+    echo "WAN device not found, pass it as the second argument. Devices: $(ls /sys/class/net | tr '\n' ' ')" >&2
+    WAN=""
+fi
 
 for d in $(ls /sys/class/net | grep '^tunrw'); do
     if grep -q '^DEVTYPE=ovpn$' "/sys/class/net/$d/uevent"; then
@@ -38,11 +42,16 @@ while sleep "$INTERVAL"; do
     new=$(snapshot)
     printf '%s\n%s\n' "$old" "$new" | awk -v t="$INTERVAL" -v wan="$WAN" '
         { key = $1 " " $2 }
-        !(key in a) { a[key] = $3; b[key] = $4; c[key] = $5; next }
+        {
+            # the first snapshot is the starting point
+            if (!(key in a)) { a[key] = $3; b[key] = $4; c[key] = $5; next }
+        }
         $1 == "net" {
             i = ($3 - a[key]) * 8 / t / 1000000
             o = ($4 - b[key]) * 8 / t / 1000000
-            printf "%-18s in %7.1f  out %7.1f Mbit/s\n", ($2 == wan) ? $2 " (WAN)" : $2, i, o
+            name = $2
+            if ($2 == wan) name = $2 " (WAN)"
+            printf "%-18s in %8.2f  out %8.2f Mbit/s\n", name, i, o
             if ($2 != wan) { ti += i; to += o }
             next
         }
@@ -54,7 +63,7 @@ while sleep "$INTERVAL"; do
             }
         }
         END {
-            printf "%-18s in %7.1f  out %7.1f Mbit/s\n", "all servers", ti, to
+            printf "%-18s in %8.2f  out %8.2f Mbit/s\n", "all servers", ti, to
             printf "CPU busy %%:   %s\nCPU softirq %%:%s\n---\n", busy, sirq
         }'
     old=$new
