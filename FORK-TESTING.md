@@ -166,8 +166,9 @@ To install a newer version of the files, repeat steps 1–4: the backup of the o
       every server, and filtering on any single server shows its connections
    5. delete servers until there are 5: each server gets its tab back
 9. **DCO** (only with `ns-dco.tar.gz`):
-   1. `lsmod | grep ovpn` shows the module, and `ip -d link show tunrw1` shows `ovpn` instead of `tun`
-      for every routed server. `grep -i openvpn /var/log/messages | grep -i dco` explains why a server doesn't use it:
+   1. `lsmod | grep ovpn` shows the module, and `grep DEVTYPE /sys/class/net/tunrw1/uevent` shows
+      `DEVTYPE=ovpn` for every routed server (a server without DCO has no `DEVTYPE` line).
+      `grep -i openvpn /var/log/messages | grep -i dco` explains why a server doesn't use it:
       bridged servers, CBC ciphers and compression turn it off
    2. users connect, the connected-users list and the connection history (duration, traffic) work as before
    3. with client-to-client enabled, two clients of the same server can ping each other, and the firewall
@@ -184,6 +185,12 @@ To install a newer version of the files, repeat steps 1–4: the backup of the o
 
       Remove it with `uci delete openvpn.ns_roadwarrior1.disable_dco`, then commit and restart again.
       Without DCO one `openvpn` process uses at most one CPU core: watch it in `top`
+
+      `tools/fork-test/vpn-traffic.sh` shows which servers use DCO, the live traffic of each server and of the
+      WAN, and the load of each CPU core. Copy it to the firewall and run `sh vpn-traffic.sh` during a test.
+      A single core near 100% softirq while the others are idle means the network card delivers all the
+      packets to one core: try OpenWrt's packet steering (`uci set network.globals.packet_steering='1'`,
+      `uci commit network`, `/etc/init.d/packet_steering reload`)
 
 Useful commands on the firewall:
 
