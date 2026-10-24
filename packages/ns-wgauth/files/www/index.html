@@ -1,0 +1,59 @@
+<!doctype html>
+<!--
+  Copyright (C) 2026 Nethesis S.r.l.
+  SPDX-License-Identifier: GPL-2.0-only
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <title>VPN login</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <main class="card">
+      <h1>VPN login</h1>
+      <p id="server" class="muted"></p>
+
+      <p id="loading" class="muted">Checking the connection…</p>
+
+      <section id="unavailable" hidden>
+        <p>
+          This page works only through a WireGuard VPN that requires a login. Connect the tunnel, then open the
+          address written in your VPN configuration.
+        </p>
+        <button id="retry" type="button" class="secondary">Try again</button>
+      </section>
+
+      <form id="login" hidden novalidate>
+        <p class="muted">Your VPN is connected. Log in to use it.</p>
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" required />
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required />
+        <div id="otp-field" hidden>
+          <label for="otp">OTP code</label>
+          <input
+            id="otp"
+            name="otp"
+            type="text"
+            inputmode="numeric"
+            pattern="[0-9]{6}"
+            maxlength="6"
+            autocomplete="one-time-code"
+          />
+        </div>
+        <p id="login-error" class="error" role="alert" hidden></p>
+        <button id="submit" type="submit">Log in</button>
+      </form>
+
+      <section id="session" hidden>
+        <p class="success" role="status">You are logged in as <strong id="user"></strong>.</p>
+        <p class="muted">The session ends <span id="expires"></span>. Log in again after that to keep using the VPN.</p>
+        <button id="logout" type="button" class="secondary">Log out</button>
+      </section>
+    </main>
+  </body>
+</html>

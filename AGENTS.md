@@ -67,7 +67,7 @@ recent host Ruby (4.x), so the site is built in a `ruby:3.3` container and the
 
 | Directory | Content |
 |---|---|
-| `packages/` | Custom OpenWrt feed; 37 `ns-*` packages |
+| `packages/` | Custom OpenWrt feed; 38 packages, 23 of them `ns-*` |
 | `config/` | Diffconfig fragments per feature; `config/targets/<arch>.conf` for arch-specific config |
 | `files/` | Filesystem overlay copied verbatim into image |
 | `patches/` | Patches applied to upstream OpenWrt feeds |
@@ -121,6 +121,7 @@ APIs are Python 3 scripts placed at `/usr/libexec/rpcd/ns.<name>` on the device.
 **UCI conventions:**
 - Zones: `ns_<zonename>` (e.g., `ns_lan`, `ns_guest`).
 - Firewall rule IDs: prefix `ns_` (e.g., `ns_206325d3`); system rules flagged `system_rule: true`.
+- WireGuard login: a server with `ns_auth_mode` other than `key` lets its peers through only after the linked user (peer option `ns_user`, from the server's `ns_user_db`) logs in on a web page. The `ns-wgauth` package enforces it with the `inet ns_wgauth` nftables table, separate from fw4; read or end sessions through `nethsec.wgauth`, never by editing the table. A missing login option on `edit-server`/`edit-peer` keeps the current value, so older clients can't turn the login off. See [`docs/design/wireguard_user_auth.md`](docs/design/wireguard_user_auth.md).
 
 ---
 

@@ -8554,6 +8554,9 @@ Response example:
 
 Configure WireGuard VPN in site-to-site mode.
 
+A server can require its peers to log in with the credentials of a local users database before they can use the VPN:
+see the `auth_mode` parameter of `add-server` and the [ns-wgauth](../ns-wgauth) package.
+
 ### import-configuration
 
 Import a WireGuard configuration file, must be base64 encoded:
@@ -8574,9 +8577,13 @@ Response example:
   "listen_port": 51822,
   "instance": "wg3",
   "network": "10.245.149.0/24",
-  "public_endpoint": "79.19.71.172"
+  "public_endpoint": "79.19.71.172",
+  "auth_modes": ["key", "key_password", "key_password_otp"]
 }
 ```
+
+`auth_modes` lists the values accepted by the `auth_mode` parameter of `add-server`: a client can show the login
+options only when it's present.
 
 ### list-servers
 
@@ -8607,17 +8614,38 @@ Response example:
           "remote_networks": [],
           "local_networks": [],
           "reserved_ip": "10.1.122.2",
-          "config": "[Interface]\n# Name = iPhone di Tommaso\nPrivateKey = XXX\nAddress = 10.1.122.2\n# DNS not configured\n\n[Peer]\n# Name = HQ\nPublicKey = XXX\nPresharedKey = XXX\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 127.0.0.1:51820\nPersistentKeepalive = 25\n",
+          "config": "[Interface]\n# Name = iPhone di Tommaso\n# Login = http://10.1.122.1:8181/\nPrivateKey = XXX\nAddress = 10.1.122.2\n# DNS not configured\n\n[Peer]\n# Name = HQ\nPublicKey = XXX\nPresharedKey = XXX\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 127.0.0.1:51820\nPersistentKeepalive = 25\n",
+          "user": "tommaso",
+          "authenticated": true,
+          "auth_expires": "2025-09-30T16:52:29+00:00",
           "active": true,
           "latest_handshake": "2025-09-30T08:52:29+00:00"
         }
       ],
       "mtu": 0,
-      "dns": []
+      "dns": [],
+      "auth_mode": "key_password",
+      "user_db": "main",
+      "auth_timeout": 28800,
+      "login_url": "http://10.1.122.1:8181/",
+      "auth_enforced": true
     }
   ]
 }
 ```
+
+Login fields of a server:
+- `auth_mode`: `key` (no login), `key_password` or `key_password_otp`
+- `user_db`: the users database of the login, empty in `key` mode
+- `auth_timeout`: session length in seconds
+- `login_url`: the login page of the peers, empty in `key` mode
+- `auth_enforced`: `false` if the server requires the login but the firewall doesn't enforce it (the `ns-wgauth`
+  service isn't running or failed): the peers can use the VPN without logging in
+
+Login fields of a peer:
+- `user`: the linked user, empty if there is none
+- `authenticated`: `true` while the user is logged in
+- `auth_expires`: when the session ends, only if `authenticated` is `true`
 
 
 ### add-server
@@ -8635,6 +8663,23 @@ Parameters:
 - `network`: the network of the WireGuard instance, this is the client subnet
 - `mtu`: the MTU of the WireGuard interface, if kept empty auto-detection will be used
 - `dns`: the DNS servers that the clients can use to avoid dns bleeding
+- `auth_mode` (optional): `key` (default) to use only the WireGuard keys, `key_password` to require also the
+  username and password of `user_db`, `key_password_otp` to require also an OTP code
+- `user_db` (required unless `auth_mode` is `key`): a local users database
+- `auth_timeout` (optional): session length in seconds, from 300 to 604800, default 28800
+
+Example of a server that requires the login:
+```
+api-cli ns.wireguard add-server --data '{"enabled": true, "name": "Road warriors", "public_endpoint": "wireguard.example.com", "listen_port": 51823, "network": "10.1.86.0/24", "mtu": "", "dns": [], "auth_mode": "key_password_otp", "user_db": "main", "auth_timeout": 28800}'
+```
+
+Validation errors of the login parameters:
+- `auth_mode`: `invalid`; `peers_with_remote_networks` on `edit-server` if a peer has remote networks
+- `user_db`: `required`, `db_not_found`, `db_not_local`
+- `auth_timeout`: `invalid`
+
+With `key_password_otp`, the users linked to the peers get an OTP secret if they don't have one yet, see
+`download-peer-2fa`.
 
 ### edit-server
 
@@ -8646,7 +8691,8 @@ api-cli ns.wireguard edit-server --data '{"instance": "wgX",enabled": true, "nam
 Parameters:
 - `instance`: the name of the WireGuard instance, the instance must exist
 
-All other parameters are the same as in `add-server`.
+All other parameters are the same as in `add-server`. If `auth_mode` is missing, the login options keep their current
+values; `auth_mode` `key` removes the users database of the server.
 
 ### delete-server
 
@@ -8692,6 +8738,12 @@ Parameters:
 - `route_all_traffic`: `true` to route all the traffic of the peer through the WireGuard tunnel, this will effectively ignore the local networks param
 - `local_networks`: the local networks that the peer will be able to access, this parameter is used during the client configuration creation
 - `remote_networks`: the networks that the peer will route through the WireGuard tunnel, this parameter is used during the client configuration creation
+- `user` (required if the server requires the login, ignored otherwise): the user of the server's `user_db` who logs
+  in with this peer
+
+On a server that requires the login:
+- `user` validation errors: `required`, `user_not_found`
+- `remote_networks` must be empty, validation error `not_allowed`: the login identifies the peer by its reserved IP
 
 
 ### edit-peer
@@ -8704,7 +8756,7 @@ api-cli ns.wireguard add-peer --data '{"instance": "wg3", "id": "peerid", "enabl
 Parameters:
 - `id`: the id of the peer, it can be found in the `list-servers` output
 
-All other parameters are the same as in `add-peer`
+All other parameters are the same as in `add-peer`. If `user` is missing, the peer keeps its current user.
 
 ### delete-peer
 
@@ -8715,6 +8767,36 @@ api-cli ns.wireguard delete-peer --data '{"id": "peerid"}'
 
 Parameters:
 - `id`: the id of the peer, it can be found in the `list-servers` output
+
+### logout-peer
+
+End the login session of a peer: the peer must log in again to use the VPN, its open connections are closed.
+It changes no configuration, no commit is needed:
+```
+api-cli ns.wireguard logout-peer --data '{"id": "wg1_ns_76e103f5_peer"}'
+```
+
+Response example:
+```json
+{"result": "success"}
+```
+
+Errors: validation error `id` `required` or `invalid`, error `logout_failed`.
+
+### download-peer-2fa
+
+Return the OTP QR code of the user linked to a peer, as SVG, for a server with `auth_mode` `key_password_otp`.
+The secret is the same used by OpenVPN Road Warrior:
+```
+api-cli ns.wireguard download-peer-2fa --data '{"id": "wg1_ns_76e103f5_peer"}'
+```
+
+Response example:
+```json
+{"data": "<?xml version=\"1.0\" standalone=\"yes\"?>\n<svg ...>...</svg>\n"}
+```
+
+Validation errors of `id`: `required`, `invalid`, `otp_not_required`, `user_not_found`, `2fa_download_failed`.
 
 
 ### list-tunnels
