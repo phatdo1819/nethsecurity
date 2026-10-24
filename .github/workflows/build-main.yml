@@ -12,6 +12,7 @@ on:
     branches:
       - 'main'
       - 'ci-fork'
+      - 'ci-wgauth'
     paths:
       - '.github/workflows/**'
       - 'builder/**'
