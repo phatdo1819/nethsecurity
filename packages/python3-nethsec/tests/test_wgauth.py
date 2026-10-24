@@ -18,7 +18,7 @@ config interface 'wg1'
 	option proto 'wireguard'
 	option ns_type 'server'
 	option ns_auth_mode 'key_password'
-	option ns_user_db 'main'
+	option ns_user_db 'wgauth_users'
 	option ns_auth_timeout '3600'
 	list addresses '10.103.1.1/24'
 
@@ -54,7 +54,7 @@ config interface 'wg4'
 	option proto 'wireguard'
 	option ns_type 'server'
 	option ns_auth_mode 'key_password_otp'
-	option ns_user_db 'main'
+	option ns_user_db 'wgauth_users'
 	option disabled '1'
 	list addresses '10.103.4.1/24'
 
@@ -67,27 +67,27 @@ config interface 'wg5'
 	option proto 'wireguard'
 	option ns_type 'server'
 	option ns_auth_mode 'typo'
-	option ns_user_db 'main'
+	option ns_user_db 'wgauth_users'
 	list addresses '10.103.5.1/24'
 """
 
 users_db = """
-config local 'main'
+config local 'wgauth_users'
 	option description 'Main local database'
 
-config ldap 'ldap1'
+config ldap 'wgauth_ldap'
 	option description 'Remote OpenLDAP server'
 	option uri 'ldap://192.168.1.1'
 
-config user 'ns_alice'
+config user 'ns_wgalice'
 	option name 'alice'
-	option database 'main'
+	option database 'wgauth_users'
 	option password '{password}'
 	option openvpn_2fa '{secret}'
 
-config user 'ns_carol'
+config user 'ns_wgcarol'
 	option name 'carol'
-	option database 'main'
+	option database 'wgauth_users'
 """
 
 wgauth_db = """
@@ -107,7 +107,8 @@ def _setup_db(tmp_path, port=True):
     if port:
         with conf_dir.joinpath("ns-wgauth").open("w") as fp:
             fp.write(wgauth_db)
-    # a dedicated savedir: the changes saved by other tests in the default one would apply here too
+    # keep the changes saved by these tests out of the default savedir. libuci still applies the changes that
+    # other tests saved there (test_users deletes the main database): the fixtures use names nobody else uses
     save_dir = tmp_path.joinpath("save")
     save_dir.mkdir()
     return EUci(confdir=conf_dir.as_posix(), savedir=save_dir.as_posix())
@@ -226,13 +227,13 @@ def test_find_peer(tmp_path):
 
 def test_get_peer_user(tmp_path):
     u = _setup_db(tmp_path)
-    assert wgauth.get_peer_user(u, "wg1", "wg1_ns_aaaaaaaa_peer")["id"] == "ns_alice"
+    assert wgauth.get_peer_user(u, "wg1", "wg1_ns_aaaaaaaa_peer")["id"] == "ns_wgalice"
     # the user doesn't exist
     assert wgauth.get_peer_user(u, "wg1", "wg1_ns_bbbbbbbb_peer") is None
     # no user linked
     assert wgauth.get_peer_user(u, "wg1", "wg1_ns_eeeeeeee_peer") is None
     # only local databases
-    u.set("network", "wg1", "ns_user_db", "ldap1")
+    u.set("network", "wg1", "ns_user_db", "wgauth_ldap")
     assert wgauth.get_peer_user(u, "wg1", "wg1_ns_aaaaaaaa_peer") is None
 
 
@@ -267,16 +268,16 @@ def test_check_credentials_otp(tmp_path):
 
 def test_ensure_otp_secret(tmp_path):
     u = _setup_db(tmp_path)
-    alice = users.get_user_by_name(u, "alice", "main")
+    alice = users.get_user_by_name(u, "alice", "wgauth_users")
     assert not wgauth.ensure_otp_secret(u, alice)
-    carol = users.get_user_by_name(u, "carol", "main")
+    carol = users.get_user_by_name(u, "carol", "wgauth_users")
     assert wgauth.ensure_otp_secret(u, carol)
-    assert len(u.get("users", "ns_carol", "openvpn_2fa")) == 32
+    assert len(u.get("users", "ns_wgcarol", "openvpn_2fa")) == 32
 
 
 def test_user_fingerprint(tmp_path):
     u = _setup_db(tmp_path)
-    alice = users.get_user_by_name(u, "alice", "main")
+    alice = users.get_user_by_name(u, "alice", "wgauth_users")
     fingerprint = wgauth.user_fingerprint(u, "wg1", alice)
     assert fingerprint == wgauth.user_fingerprint(u, "wg1", alice)
     assert fingerprint != wgauth.user_fingerprint(u, "wg1", dict(alice, password=users.shadow_password("new")))
@@ -416,7 +417,7 @@ def test_open_session_rejects_bad_address(tmp_path, mocker, run_dir):
 
 
 def _session(u, peer="wg1_ns_aaaaaaaa_peer", user="alice"):
-    alice = users.get_user_by_name(u, "alice", "main")
+    alice = users.get_user_by_name(u, "alice", "wgauth_users")
     return {"peer": peer, "user": user, "fingerprint": wgauth.user_fingerprint(u, "wg1", alice)}
 
 
@@ -442,7 +443,7 @@ def test_session_problem(tmp_path):
     assert problem(handshakes=None) is None
     assert problem(handshakes={}, idle=0) is None
 
-    u.set("users", "ns_alice", "password", users.shadow_password("new password"))
+    u.set("users", "ns_wgalice", "password", users.shadow_password("new password"))
     assert problem() == "user_changed"
 
 
