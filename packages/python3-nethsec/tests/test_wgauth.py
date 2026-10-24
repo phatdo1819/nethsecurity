@@ -98,14 +98,19 @@ config main 'config'
 
 
 def _setup_db(tmp_path, port=True):
-    with tmp_path.joinpath("network").open("w") as fp:
+    conf_dir = tmp_path.joinpath("config")
+    conf_dir.mkdir()
+    with conf_dir.joinpath("network").open("w") as fp:
         fp.write(network_db)
-    with tmp_path.joinpath("users").open("w") as fp:
+    with conf_dir.joinpath("users").open("w") as fp:
         fp.write(users_db.format(password=users.shadow_password(PASSWORD), secret=OTP_SECRET))
     if port:
-        with tmp_path.joinpath("ns-wgauth").open("w") as fp:
+        with conf_dir.joinpath("ns-wgauth").open("w") as fp:
             fp.write(wgauth_db)
-    return EUci(confdir=tmp_path.as_posix())
+    # a dedicated savedir: the changes saved by other tests in the default one would apply here too
+    save_dir = tmp_path.joinpath("save")
+    save_dir.mkdir()
+    return EUci(confdir=conf_dir.as_posix(), savedir=save_dir.as_posix())
 
 
 class FakeCommands:
