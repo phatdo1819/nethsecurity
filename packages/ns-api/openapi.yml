@@ -102,6 +102,112 @@ components:
           description: Optional free-form description associated with the domain
           example: my allow1
 
+    WireGuardResult:
+      type: object
+      required: [result]
+      properties:
+        result:
+          type: string
+          example: success
+
+    WireGuardAuthMode:
+      type: string
+      enum: [key, key_password, key_password_otp]
+      description: |
+        `key` uses only the WireGuard keys. `key_password` requires also the username and password of the server's
+        users database, `key_password_otp` requires also an OTP code. The login is enforced by the ns-wgauth package.
+      example: key_password
+
+    WireGuardServerParams:
+      type: object
+      required: [enabled, name, network, listen_port, public_endpoint]
+      properties:
+        enabled:
+          type: boolean
+        name:
+          type: string
+          example: Road warriors
+        network:
+          type: string
+          description: VPN network of the clients, IPv4 CIDR
+          example: 10.1.86.0/24
+        listen_port:
+          type: integer
+          example: 51823
+        public_endpoint:
+          type: string
+          description: IP address or host name written in the client configurations
+          example: wireguard.example.com
+        mtu:
+          type: string
+          description: Empty for auto-detection
+          example: ""
+        dns:
+          type: array
+          items:
+            type: string
+          example: ["192.168.1.1"]
+        auth_mode:
+          $ref: "#/components/schemas/WireGuardAuthMode"
+        user_db:
+          type: string
+          description: Local users database, required unless auth_mode is key
+          example: main
+        auth_timeout:
+          type: integer
+          minimum: 300
+          maximum: 604800
+          description: Session length in seconds, default 28800
+          example: 28800
+
+    WireGuardPeerParams:
+      type: object
+      required: [instance, enabled, name, reserved_ip, pre_shared_key, route_all_traffic, remote_networks]
+      properties:
+        instance:
+          type: string
+          example: wg1
+        enabled:
+          type: boolean
+        name:
+          type: string
+          example: Alice laptop
+        reserved_ip:
+          type: string
+          example: 10.1.86.2
+        pre_shared_key:
+          type: boolean
+        route_all_traffic:
+          type: boolean
+        local_networks:
+          type: array
+          description: Required if route_all_traffic is false
+          items:
+            type: string
+          example: ["192.168.100.0/24"]
+        remote_networks:
+          type: array
+          description: Must be empty on a server that requires the login
+          items:
+            type: string
+          example: []
+        mtu:
+          type: string
+          example: ""
+        user:
+          type: string
+          description: User of the server's users database, required if the server requires the login
+          example: alice
+
+    WireGuardPeerId:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          description: Peer id, from list-servers
+          example: wg1_ns_76e103f5_peer
+
   securitySchemes:
     BearerAuth:
       type: http
@@ -747,3 +853,211 @@ paths:
                         example: success
                   - $ref: "#/components/schemas/ValidationError"
                   - $ref: "#/components/schemas/Error"
+  POST /ubus/ns.wireguard/list-servers:
+    post:
+      summary: List the WireGuard servers and their peers, with the login state
+      operationId: ns.wireguard.list-servers
+      tags:
+        - wireguard
+      responses:
+        "200":
+          description: WireGuard servers
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [instances]
+                properties:
+                  instances:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          example: wg1
+                        name:
+                          type: string
+                        enabled:
+                          type: boolean
+                        auth_mode:
+                          $ref: "#/components/schemas/WireGuardAuthMode"
+                        user_db:
+                          type: string
+                          description: Empty in key mode
+                        auth_timeout:
+                          type: integer
+                        login_url:
+                          type: string
+                          description: Login page of the peers, empty in key mode
+                          example: http://10.1.86.1:8181/
+                        auth_enforced:
+                          type: boolean
+                          description: False when the login is required but the firewall doesn't enforce it
+                        peers:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id:
+                                type: string
+                              name:
+                                type: string
+                              reserved_ip:
+                                type: string
+                              config:
+                                type: string
+                                description: Client configuration, with a "# Login = URL" comment if the login is required
+                              user:
+                                type: string
+                                description: Linked user, empty if none
+                              authenticated:
+                                type: boolean
+                              auth_expires:
+                                type: string
+                                format: date-time
+                                description: Present only while authenticated
+  POST /ubus/ns.wireguard/add-server:
+    post:
+      summary: Add a WireGuard server
+      operationId: ns.wireguard.add-server
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WireGuardServerParams"
+      responses:
+        "200":
+          description: Server added or validation failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WireGuardResult"
+                  - $ref: "#/components/schemas/ValidationError"
+  POST /ubus/ns.wireguard/edit-server:
+    post:
+      summary: Edit a WireGuard server
+      description: Without auth_mode, the login options keep their current values.
+      operationId: ns.wireguard.edit-server
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/WireGuardServerParams"
+                - type: object
+                  required: [instance]
+                  properties:
+                    instance:
+                      type: string
+                      example: wg1
+      responses:
+        "200":
+          description: Server edited or validation failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WireGuardResult"
+                  - $ref: "#/components/schemas/ValidationError"
+  POST /ubus/ns.wireguard/add-peer:
+    post:
+      summary: Add a peer to a WireGuard server
+      operationId: ns.wireguard.add-peer
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WireGuardPeerParams"
+      responses:
+        "200":
+          description: Peer added or validation failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WireGuardResult"
+                  - $ref: "#/components/schemas/ValidationError"
+  POST /ubus/ns.wireguard/edit-peer:
+    post:
+      summary: Edit a peer of a WireGuard server
+      description: Without user, the peer keeps its current user.
+      operationId: ns.wireguard.edit-peer
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/WireGuardPeerParams"
+                - $ref: "#/components/schemas/WireGuardPeerId"
+      responses:
+        "200":
+          description: Peer edited or validation failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WireGuardResult"
+                  - $ref: "#/components/schemas/ValidationError"
+  POST /ubus/ns.wireguard/logout-peer:
+    post:
+      summary: End the login session of a peer
+      description: The peer must log in again to use the VPN. No configuration changes, no commit needed.
+      operationId: ns.wireguard.logout-peer
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WireGuardPeerId"
+      responses:
+        "200":
+          description: Session ended, or there was none
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WireGuardResult"
+                  - $ref: "#/components/schemas/ValidationError"
+                  - $ref: "#/components/schemas/Error"
+  POST /ubus/ns.wireguard/download-peer-2fa:
+    post:
+      summary: Return the OTP QR code of the user linked to a peer
+      operationId: ns.wireguard.download-peer-2fa
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WireGuardPeerId"
+      responses:
+        "200":
+          description: QR code as SVG, or validation failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [data]
+                    properties:
+                      data:
+                        type: string
+                        description: SVG image
+                  - $ref: "#/components/schemas/ValidationError"

@@ -9,7 +9,7 @@ import sys
 import json
 import subprocess
 from euci import EUci
-from nethsec import utils, firewall, ovpn
+from nethsec import utils, firewall, ovpn, users, wgauth
 import ipaddress
 import base64
 import configparser
@@ -53,13 +53,14 @@ def generate_wireguard_keys():
 def list_servers():
     u = EUci()
     ret = []
-    # Fetch active peers once for all servers
+    # Fetch active peers and login sessions once for all servers
     peers_status = __active_peers()
+    sessions = wgauth.list_sessions()
     interfaces = utils.get_all_by_type(u, "network", "interface")
     for i in interfaces:
         interface = interfaces[i]
         if interface.get("proto") == "wireguard" and interface.get("ns_type", '') == 'server':
-            ret.append(__get_server_configuration(u, i, peers_status))
+            ret.append(__get_server_configuration(u, i, peers_status, sessions))
     return ret
 
 
@@ -130,6 +131,8 @@ def get_instance_defaults():
         ret["public_endpoint"] = ovpn.get_public_addresses(u)[0]
     except:
         ret["public_endpoint"] = ""
+    # tells the clients that the login with user credentials is supported
+    ret["auth_modes"] = list(wgauth.AUTH_MODES)
     return ret
 
 
@@ -290,9 +293,62 @@ def __validate_tunnel_data(args):
     return None
 
 
+def __validate_auth_data(e_uci, args, instance=None):
+    """
+    Validate the login options of a server. On edit, missing options keep the current values: a client that
+    doesn't know them must not turn the login off.
+    """
+    if instance is not None and 'auth_mode' not in args:
+        auth_mode = wgauth.get_auth_mode(e_uci, instance)
+    else:
+        auth_mode = args.get('auth_mode', 'key')
+    if auth_mode not in wgauth.AUTH_MODES:
+        return utils.validation_error('auth_mode', 'invalid', auth_mode)
+    if 'auth_timeout' in args:
+        timeout = args['auth_timeout']
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or not (wgauth.MIN_TIMEOUT <= timeout <= wgauth.MAX_TIMEOUT):
+            return utils.validation_error('auth_timeout', 'invalid', timeout)
+    if auth_mode == 'key' or 'auth_mode' not in args:
+        return None
+    user_db = args.get('user_db', '')
+    if not isinstance(user_db, str) or user_db == '':
+        return utils.validation_error('user_db', 'required')
+    db_type = users.get_database_type(e_uci, user_db)
+    if db_type == '':
+        return utils.validation_error('user_db', 'db_not_found', user_db)
+    if db_type != 'local':
+        return utils.validation_error('user_db', 'db_not_local', user_db)
+    if instance is not None:
+        # the login identifies a peer by its reserved IP: traffic from remote networks would be blocked
+        for peer in wgauth.list_peers(e_uci, instance):
+            if e_uci.get('network', peer, 'ns_routes', dtype=str, list=True, default=[]):
+                return utils.validation_error('auth_mode', 'peers_with_remote_networks', auth_mode)
+    return None
+
+
+def __set_auth_options(e_uci, instance, args):
+    if 'auth_mode' in args:
+        e_uci.set('network', instance, 'ns_auth_mode', args['auth_mode'])
+        if args['auth_mode'] == 'key':
+            e_uci.delete('network', instance, 'ns_user_db')
+        else:
+            e_uci.set('network', instance, 'ns_user_db', args['user_db'])
+    if 'auth_timeout' in args:
+        e_uci.set('network', instance, 'ns_auth_timeout', args['auth_timeout'])
+    if wgauth.requires_otp(e_uci, instance):
+        # the users linked before OTP was required need a secret
+        for peer in wgauth.list_peers(e_uci, instance):
+            user = wgauth.get_peer_user(e_uci, instance, peer)
+            if user is not None:
+                wgauth.ensure_otp_secret(e_uci, user)
+
+
 def add_server(args):
     # validate input
     err = __validate_tunnel_data(args)
+    if err:
+        return err
+    err = __validate_auth_data(EUci(), args)
     if err:
         return err
     # save instance
@@ -315,6 +371,7 @@ def add_server(args):
     e_uci.set('network', instance, 'ns_name', args['name'])
     e_uci.set('network', instance, 'disabled', not args['enabled'])
     e_uci.set('network', instance, 'ns_type', 'server')
+    __set_auth_options(e_uci, instance, args)
     e_uci.save('network')
     # configure firewall
     firewall.add_service(
@@ -338,6 +395,11 @@ def edit_server(args):
     if err:
         return err
     e_uci = EUci()
+    if not wgauth.is_server(e_uci, args['instance']):
+        return utils.validation_error('instance', 'invalid', args['instance'])
+    err = __validate_auth_data(e_uci, args, args['instance'])
+    if err:
+        return err
     e_uci.set('network', args['instance'], 'listen_port', args['listen_port'])
     interface_network = ipaddress.IPv4Network(args['network'])
     first_ip = str(list(interface_network.hosts())[0])
@@ -353,6 +415,7 @@ def edit_server(args):
     e_uci.set('network', args['instance'], 'ns_public_endpoint', args['public_endpoint'])
     e_uci.set('network', args['instance'], 'ns_name', args['name'])
     e_uci.set('network', args['instance'], 'disabled', not args['enabled'])
+    __set_auth_options(e_uci, args['instance'], args)
     e_uci.save('network')
 
     return {"result": "success"}
@@ -443,8 +506,34 @@ def __validate_peer_data(args):
         except ValueError:
             if args['mtu'] != '':
                 return utils.validation_error('mtu', 'invalid', args['mtu'])
+    if wgauth.is_gated(e_uci, args['instance']):
+        # on edit, a missing user keeps the current one
+        if 'user' in args:
+            user = args['user']
+        elif args.get('id'):
+            user = e_uci.get('network', args['id'], 'ns_user', default='')
+        else:
+            user = ''
+        if not isinstance(user, str) or user == '':
+            return utils.validation_error('user', 'required')
+        user_db = e_uci.get('network', args['instance'], 'ns_user_db', default='')
+        if not user_db or users.get_user_by_name(e_uci, user, user_db) is None:
+            return utils.validation_error('user', 'user_not_found', user)
+        # the login identifies a peer by its reserved IP: traffic from remote networks would be blocked
+        if any(net != '' for net in args['remote_networks']):
+            return utils.validation_error('remote_networks', 'not_allowed', args['remote_networks'])
 
     return None
+
+
+def __set_peer_user(e_uci, instance, peer, args):
+    if not wgauth.is_gated(e_uci, instance) or 'user' not in args:
+        return
+    user = users.get_user_by_name(e_uci, args['user'], e_uci.get('network', instance, 'ns_user_db'))
+    # store the name as written in the database
+    e_uci.set('network', peer, 'ns_user', user['name'])
+    if wgauth.requires_otp(e_uci, instance):
+        wgauth.ensure_otp_secret(e_uci, user)
 
 
 def add_peer(args):
@@ -482,6 +571,7 @@ def add_peer(args):
     e_uci.set('network', peer_section, 'private_key', private_key)
     e_uci.set('network', peer_section, 'route_allowed_ips', True)
     e_uci.set('network', peer_section, 'ns_link', f'network/{args["instance"]}')
+    __set_peer_user(e_uci, args['instance'], peer_section, args)
     e_uci.save('network')
 
     return {"result": "success"}
@@ -524,6 +614,7 @@ def edit_peer(args):
         e_uci.set('network', args['id'], 'ns_mtu', args['mtu'])
     else:
         e_uci.delete('network', args['id'], 'ns_mtu')
+    __set_peer_user(e_uci, args['instance'], args['id'], args)
     e_uci.save('network')
 
     return {"result": "success"}
@@ -542,10 +633,13 @@ def delete_peer(args):
     return {"result": "success"}
 
 
-def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_name, server_network, server_endpoint, server_port):
+def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_name, server_network, server_endpoint, server_port, login_url=None):
     """Generate peer config reusing EUci instance and pre-computed server data."""
     config = "[Interface]\n"
     config += f"# Name = {u.get('network', peer_id, 'ns_name')}\n"
+    if login_url:
+        # the clients ignore comments: this tells the user where to log in after connecting
+        config += f"# Login = {login_url}\n"
     config += f"PrivateKey = {u.get('network', peer_id, 'private_key')}\n"
     config += f"Address = {u.get('network', peer_id, 'ns_ip')}\n"
     peer_mtu = u.get('network', peer_id, 'ns_mtu', dtype=int, default=0)
@@ -575,8 +669,8 @@ def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_nam
     return config
 
 
-def __get_server_configuration(u, instance, peers_status):
-    """Get server configuration with peers, reusing EUci instance and pre-fetched peer status."""
+def __get_server_configuration(u, instance, peers_status, sessions):
+    """Get server configuration with peers, reusing EUci instance and pre-fetched peer status and sessions."""
     if u.get('network', instance, default=None) is None:
         return utils.generic_error("instance_not_found")
 
@@ -594,9 +688,16 @@ def __get_server_configuration(u, instance, peers_status):
     # Compute server public key once for all peers
     server_public_key = subprocess.run(["wg", "pubkey"], input=server_private_key, capture_output=True, text=True).stdout.strip()
 
+    # login with user credentials, see nethsec.wgauth
+    gated = wgauth.is_gated(u, instance)
+    login_url = wgauth.get_login_url(u, instance) if gated else None
+    server_sessions = sessions.get(instance, {})
+    now = datetime.now(timezone.utc).timestamp()
+
     # Build peers list
     peers = []
     for p in utils.get_all_by_type(u, "network", f"wireguard_{instance}"):
+        reserved_ip = u.get("network", p, "ns_ip", dtype=str)
         peer = {
             "id": p,
             "enabled": not u.get("network", p, "disabled", dtype=bool, default=False),
@@ -605,13 +706,17 @@ def __get_server_configuration(u, instance, peers_status):
             "route_all_traffic": u.get('network', p, "ns_route_all_traffic", dtype=bool, default=False),
             "remote_networks": u.get('network', p, 'ns_routes', dtype=str, list=True, default=[]),
             "local_networks": u.get('network', p, 'ns_local_routes', dtype=str, list=True, default=[]),
-            "reserved_ip": u.get("network", p, "ns_ip", dtype=str),
+            "reserved_ip": reserved_ip,
             "mtu": u.get('network', p, 'ns_mtu', dtype=int, default=0),
             "config": __generate_peer_config(
                 u, p, server_public_key, server_dns, server_name,
-                server_network, server_endpoint, server_port
+                server_network, server_endpoint, server_port, login_url
             ),
+            "user": u.get('network', p, 'ns_user', default=''),
+            "authenticated": gated and reserved_ip in server_sessions,
         }
+        if peer["authenticated"]:
+            peer["auth_expires"] = datetime.fromtimestamp(now + server_sessions[reserved_ip], tz=timezone.utc).isoformat()
         public_key = u.get('network', p, 'public_key', dtype=str, default='')
         if public_key in peers_status:
             peer["active"] = peers_status[public_key]["active"]
@@ -630,7 +735,13 @@ def __get_server_configuration(u, instance, peers_status):
         "enabled": server_enabled,
         "peers": peers,
         "mtu": server_mtu,
-        "dns": server_dns
+        "dns": server_dns,
+        "auth_mode": wgauth.get_auth_mode(u, instance),
+        "user_db": u.get('network', instance, 'ns_user_db', default=''),
+        "auth_timeout": wgauth.get_session_timeout(u, instance),
+        "login_url": login_url or '',
+        # false when the login is required but the firewall doesn't enforce it, see ns-wgauth
+        "auth_enforced": gated and instance in sessions
     }
 
 
@@ -850,6 +961,54 @@ def delete_tunnel(args):
     return {"result": "success"}
 
 
+def __get_server_peer(e_uci, args):
+    """Return the server of the peer in args['id'], or a validation error."""
+    if 'id' not in args or args['id'] == '':
+        return None, utils.validation_error('id', 'required')
+    section_type = e_uci.get('network', args['id'], default='')
+    instance = section_type[len('wireguard_'):]
+    if not section_type.startswith('wireguard_') or not wgauth.is_server(e_uci, instance):
+        return None, utils.validation_error('id', 'invalid', args['id'])
+    return instance, None
+
+
+def logout_peer(args):
+    e_uci = EUci()
+    instance, err = __get_server_peer(e_uci, args)
+    if err:
+        return err
+    address = e_uci.get('network', args['id'], 'ns_ip', default='')
+    try:
+        wgauth.close_session(instance, address, 'administrator')
+    except (RuntimeError, ValueError):
+        return utils.generic_error('logout_failed')
+    return {"result": "success"}
+
+
+def download_peer_2fa(args):
+    e_uci = EUci()
+    instance, err = __get_server_peer(e_uci, args)
+    if err:
+        return err
+    if not wgauth.requires_otp(e_uci, instance):
+        return utils.validation_error('id', 'otp_not_required', args['id'])
+    user = wgauth.get_peer_user(e_uci, instance, args['id'])
+    if user is None:
+        return utils.validation_error('id', 'user_not_found', args['id'])
+    secret = user.get('openvpn_2fa', '')
+    if not secret:
+        return utils.validation_error('id', '2fa_download_failed', args['id'])
+    import pyotp
+    with open('/proc/sys/kernel/hostname') as fp:
+        hostname = fp.read().strip()
+    server_name = e_uci.get('network', instance, 'ns_name', default=instance)
+    uri = pyotp.totp.TOTP(secret).provisioning_uri(name=f"{user['name']}@{hostname}", issuer_name=f"WireGuard {server_name}")
+    p = subprocess.run(["/usr/bin/qrencode", "-t", "svg", uri], capture_output=True, text=True)
+    if p.returncode != 0:
+        return utils.validation_error('id', '2fa_download_failed', args['id'])
+    return {"data": p.stdout}
+
+
 cmd = sys.argv[1]
 
 if cmd == 'list':
@@ -864,7 +1023,10 @@ if cmd == 'list':
             "listen_port": 51820,
             "public_endpoint": "vpn.example.com",
             "mtu": 1420,
-            "dns": ["1.1.1.1"]
+            "dns": ["1.1.1.1"],
+            "auth_mode": "key_password",
+            "user_db": "main",
+            "auth_timeout": 28800
         },
         "edit-server": {
             "instance": "wg1",
@@ -874,7 +1036,10 @@ if cmd == 'list':
             "listen_port": 51820,
             "public_endpoint": "vpn.example.com",
             "mtu": 1420,
-            "dns": ["1.1.1.1"]
+            "dns": ["1.1.1.1"],
+            "auth_mode": "key_password",
+            "user_db": "main",
+            "auth_timeout": 28800
         },
         "delete-server": {"instance": "wg1"},
         "get-peer-defaults": {"instance": "wg1"},
@@ -887,7 +1052,8 @@ if cmd == 'list':
             "route_all_traffic": False,
             "local_networks": ["192.168.1.0/24"],
             "remote_networks": [],
-            "mtu": 1420
+            "mtu": 1420,
+            "user": "john"
         },
         "edit-peer": {
             "instance": "wg1",
@@ -899,9 +1065,12 @@ if cmd == 'list':
             "route_all_traffic": False,
             "local_networks": ["192.168.1.0/24"],
             "remote_networks": [],
-            "mtu": 1420
+            "mtu": 1420,
+            "user": "john"
         },
         "delete-peer": {"id": "peerid"},
+        "logout-peer": {"id": "peerid"},
+        "download-peer-2fa": {"id": "peerid"},
         "list-tunnels": {},
         "add-tunnel": {
             "enabled": True,
@@ -964,6 +1133,12 @@ else:
     elif action == 'delete-peer':
         args = json.loads(sys.stdin.read())
         ret = delete_peer(args)
+    elif action == 'logout-peer':
+        args = json.loads(sys.stdin.read())
+        ret = logout_peer(args)
+    elif action == 'download-peer-2fa':
+        args = json.loads(sys.stdin.read())
+        ret = download_peer_2fa(args)
     elif action == 'list-tunnels':
         ret = {"tunnels": list_tunnels()}
     elif action == 'add-tunnel':
