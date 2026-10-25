@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import time
 
@@ -9,6 +10,7 @@ from nethsec import users, wgauth
 
 OTP_SECRET = "JBSWY3DPEHPK3PXP"
 PASSWORD = "Secret,1234"
+ALICE = "wg1_ns_aaaaaaaa_peer"
 
 network_db = """
 config interface 'lan'
@@ -17,6 +19,7 @@ config interface 'lan'
 config interface 'wg1'
 	option proto 'wireguard'
 	option ns_type 'server'
+	option ns_name 'Road warriors'
 	option ns_auth_mode 'key_password'
 	option ns_user_db 'wgauth_users'
 	option ns_auth_timeout '3600'
@@ -115,12 +118,14 @@ def _setup_db(tmp_path, port=True):
 
 
 class FakeCommands:
-    """Replace `wgauth._run`: answer nft and wg like the firewall would."""
+    """Replace `wgauth._run`: answer nft, wg and ubus like the firewall would."""
 
-    def __init__(self, table=None, handshakes="", endpoints=""):
+    def __init__(self, table=None, handshakes="", endpoints="", failing=()):
         self.table = table
         self.handshakes = handshakes
         self.endpoints = endpoints
+        # scripts nft refuses, matched by their first line
+        self.failing = failing
         self.calls = []
 
     def __call__(self, cmd, input=None):
@@ -129,6 +134,10 @@ class FakeCommands:
             if self.table is None:
                 return subprocess.CompletedProcess(cmd, 1, "", "Error: No such file or directory")
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"nftables": self.table}), "")
+        if cmd[0] == "nft" and cmd[-2:] == ["-f", "-"]:
+            if any(input.startswith(script) for script in self.failing):
+                return subprocess.CompletedProcess(cmd, 1, "", "Error: syntax error")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         if cmd == ["wg", "show", "all", "latest-handshakes"]:
             return subprocess.CompletedProcess(cmd, 0, self.handshakes, "")
         if cmd == ["wg", "show", "all", "endpoints"]:
@@ -170,8 +179,10 @@ def table_objects(servers, sessions=None):
 def run_dir(tmp_path, monkeypatch):
     path = tmp_path.joinpath("run")
     monkeypatch.setattr(wgauth, "RUN_DIR", path.as_posix())
-    monkeypatch.setattr(wgauth, "SESSIONS_FILE", path.joinpath("sessions.json").as_posix())
-    monkeypatch.setattr(wgauth, "LOCK_FILE", path.joinpath("lock").as_posix())
+    for name in ("sessions.json", "state.json", "blocked.json", "lock"):
+        attribute = name.split(".")[0].upper() + "_FILE"
+        monkeypatch.setattr(wgauth, attribute, path.joinpath(name).as_posix())
+    monkeypatch.setattr(wgauth, "ALERTS_FILE", tmp_path.joinpath("etc", "alerts.json").as_posix())
     return path
 
 
@@ -195,9 +206,14 @@ def test_settings(tmp_path):
     u = _setup_db(tmp_path)
     assert wgauth.get_port(u) == 9443
     assert wgauth.get_idle_timeout(u) == 120
-    assert wgauth.get_lock_endpoint(u) is True
+    assert wgauth.get_lock_endpoint(u) == "strict"
     u.set("ns-wgauth", "config", "lock_endpoint", "0")
-    assert wgauth.get_lock_endpoint(u) is False
+    assert wgauth.get_lock_endpoint(u) == "off"
+    u.set("ns-wgauth", "config", "lock_endpoint", "roaming")
+    assert wgauth.get_lock_endpoint(u) == "roaming"
+    # an unknown value keeps the lock
+    u.set("ns-wgauth", "config", "lock_endpoint", "sometimes")
+    assert wgauth.get_lock_endpoint(u) == "strict"
     assert wgauth.get_session_timeout(u, "wg1") == 3600
     assert wgauth.get_session_timeout(u, "wg4") == wgauth.DEFAULT_TIMEOUT
     assert wgauth.get_login_url(u, "wg1") == "http://10.103.1.1:9443/"
@@ -211,59 +227,130 @@ def test_default_settings(tmp_path):
     assert wgauth.get_port(u) == wgauth.DEFAULT_PORT
     assert wgauth.get_idle_timeout(u) == wgauth.DEFAULT_IDLE_TIMEOUT
     assert wgauth.get_login_url(u, "wg1") == f"http://10.103.1.1:{wgauth.DEFAULT_PORT}/"
-
-
-def test_find_peer(tmp_path):
-    u = _setup_db(tmp_path)
-    assert wgauth.find_peer(u, "10.103.1.2") == ("wg1", "wg1_ns_aaaaaaaa_peer")
-    # disabled peer
-    assert wgauth.find_peer(u, "10.103.1.3") == (None, None)
-    # server without login
-    assert wgauth.find_peer(u, "10.103.2.2") == (None, None)
-    # disabled server
-    assert wgauth.find_peer(u, "10.103.4.2") == (None, None)
-    assert wgauth.find_peer(u, "192.168.1.10") == (None, None)
+    state = wgauth.build_state(u)
+    assert state["lock_endpoint"] == "strict"
+    assert state["detect_copies"] is True
+    assert state["block_copies"] is False
+    assert state["max_failures"] == wgauth.DEFAULT_MAX_FAILURES
+    assert state["lockout_time"] == wgauth.DEFAULT_LOCKOUT_TIME
 
 
 def test_get_peer_user(tmp_path):
     u = _setup_db(tmp_path)
-    assert wgauth.get_peer_user(u, "wg1", "wg1_ns_aaaaaaaa_peer")["id"] == "ns_wgalice"
+    assert wgauth.get_peer_user(u, "wg1", ALICE)["id"] == "ns_wgalice"
     # the user doesn't exist
     assert wgauth.get_peer_user(u, "wg1", "wg1_ns_bbbbbbbb_peer") is None
     # no user linked
     assert wgauth.get_peer_user(u, "wg1", "wg1_ns_eeeeeeee_peer") is None
     # only local databases
     u.set("network", "wg1", "ns_user_db", "wgauth_ldap")
-    assert wgauth.get_peer_user(u, "wg1", "wg1_ns_aaaaaaaa_peer") is None
+    assert wgauth.get_peer_user(u, "wg1", ALICE) is None
 
 
-def test_check_credentials(tmp_path):
+def test_build_state(tmp_path):
     u = _setup_db(tmp_path)
-    peer = "wg1_ns_aaaaaaaa_peer"
-    assert wgauth.check_credentials(u, "wg1", peer, "alice", PASSWORD)["name"] == "alice"
-    assert wgauth.check_credentials(u, "wg1", peer, "ALICE", PASSWORD)["name"] == "alice"
-    assert wgauth.check_credentials(u, "wg1", peer, "alice", "wrong") is None
-    assert wgauth.check_credentials(u, "wg1", peer, "alice", "") is None
-    assert wgauth.check_credentials(u, "wg1", peer, "alice", None) is None
-    # the user must be the one linked to the peer
-    assert wgauth.check_credentials(u, "wg1", peer, "carol", PASSWORD) is None
-    # a user without password can't log in
-    u.set("network", peer, "ns_user", "carol")
-    assert wgauth.check_credentials(u, "wg1", peer, "carol", "") is None
-
-
-def test_check_credentials_otp(tmp_path):
-    u = _setup_db(tmp_path)
-    peer = "wg1_ns_aaaaaaaa_peer"
-    u.set("network", "wg1", "ns_auth_mode", "key_password_otp")
-    code = pyotp.TOTP(OTP_SECRET).now()
-    assert wgauth.check_credentials(u, "wg1", peer, "alice", PASSWORD) is None
-    assert (
-        wgauth.check_credentials(u, "wg1", peer, "alice", PASSWORD, "000000" if code != "000000" else "111111") is None
+    state = wgauth.build_state(u)
+    assert sorted(state["servers"]) == ["wg1", "wg4", "wg5"]
+    assert (state["port"], state["idle_timeout"], state["lock_endpoint"]) == (9443, 120, "strict")
+    wg1 = state["servers"]["wg1"]
+    assert (wg1["name"], wg1["enabled"], wg1["address"], wg1["otp"], wg1["timeout"]) == (
+        "Road warriors",
+        True,
+        "10.103.1.1",
+        False,
+        3600,
     )
-    assert wgauth.check_credentials(u, "wg1", peer, "alice", PASSWORD, "12345") is None
-    assert wgauth.check_credentials(u, "wg1", peer, "alice", PASSWORD, code)["name"] == "alice"
-    assert wgauth.check_credentials(u, "wg1", peer, "alice", "wrong", code) is None
+    # the disabled peer is missing, the peer without user has an empty one
+    assert sorted(wg1["peers"]) == ["10.103.1.2", "10.103.1.4"]
+    alice = wg1["peers"]["10.103.1.2"]
+    assert (alice["peer"], alice["public_key"], alice["user"], alice["otp_secret"]) == (
+        ALICE,
+        "KEY_ALICE",
+        "alice",
+        OTP_SECRET,
+    )
+    assert users.check_password(PASSWORD, alice["password"])
+    assert alice["fingerprint"] == wgauth.user_fingerprint(u, "wg1", users.get_user_by_name(u, "alice", "wgauth_users"))
+    assert wg1["peers"]["10.103.1.4"]["user"] == ""
+    assert state["servers"]["wg4"]["enabled"] is False
+    assert state["servers"]["wg4"]["otp"] is True
+    # the snapshot is plain JSON
+    assert json.loads(json.dumps(state)) == state
+
+
+def test_state_file(tmp_path, run_dir):
+    assert wgauth.load_state() is None
+    state = wgauth.build_state(_setup_db(tmp_path))
+    wgauth.save_state(state)
+    assert wgauth.load_state() == state
+    if os.name == "posix":
+        # password hashes and OTP secrets inside
+        assert os.stat(wgauth.STATE_FILE).st_mode & 0o777 == 0o600
+    with open(wgauth.STATE_FILE, "w") as fp:
+        fp.write("{broken")
+    assert wgauth.load_state() is None
+
+
+def test_find_peer(tmp_path):
+    state = wgauth.build_state(_setup_db(tmp_path))
+    server, peer = wgauth.find_peer(state, "10.103.1.2")
+    assert (server, peer["peer"]) == ("wg1", ALICE)
+    # a peer without user can use the page, to be told so
+    assert wgauth.find_peer(state, "10.103.1.4")[1]["user"] == ""
+    # disabled peer
+    assert wgauth.find_peer(state, "10.103.1.3") == (None, None)
+    # server without login
+    assert wgauth.find_peer(state, "10.103.2.2") == (None, None)
+    # disabled server
+    assert wgauth.find_peer(state, "10.103.4.2") == (None, None)
+    assert wgauth.find_peer(state, "192.168.1.10") == (None, None)
+
+
+def test_check_login(tmp_path):
+    u = _setup_db(tmp_path)
+    state = wgauth.build_state(u)
+    alice = state["servers"]["wg1"]["peers"]["10.103.1.2"]
+    assert wgauth.check_login(state, "wg1", alice, "alice", PASSWORD)
+    assert wgauth.check_login(state, "wg1", alice, "ALICE", PASSWORD)
+    assert not wgauth.check_login(state, "wg1", alice, "alice", "wrong")
+    assert not wgauth.check_login(state, "wg1", alice, "alice", "")
+    assert not wgauth.check_login(state, "wg1", alice, "alice", None)
+    # the user must be the one linked to the peer
+    assert not wgauth.check_login(state, "wg1", alice, "carol", PASSWORD)
+    # no user linked
+    nobody = state["servers"]["wg1"]["peers"]["10.103.1.4"]
+    assert not wgauth.check_login(state, "wg1", nobody, "", PASSWORD)
+    # a user without password can't log in
+    u.set("network", ALICE, "ns_user", "carol")
+    carol = wgauth.build_state(u)["servers"]["wg1"]["peers"]["10.103.1.2"]
+    assert carol["user"] == "carol"
+    assert not wgauth.check_login(state, "wg1", carol, "carol", "")
+
+
+def test_check_login_otp(tmp_path):
+    u = _setup_db(tmp_path)
+    u.set("network", "wg1", "ns_auth_mode", "key_password_otp")
+    state = wgauth.build_state(u)
+    alice = state["servers"]["wg1"]["peers"]["10.103.1.2"]
+    code = pyotp.TOTP(OTP_SECRET).now()
+    assert not wgauth.check_login(state, "wg1", alice, "alice", PASSWORD)
+    assert not wgauth.check_login(state, "wg1", alice, "alice", PASSWORD, "000000" if code != "000000" else "111111")
+    assert not wgauth.check_login(state, "wg1", alice, "alice", PASSWORD, "12345")
+    assert wgauth.check_login(state, "wg1", alice, "alice", PASSWORD, code)
+    assert not wgauth.check_login(state, "wg1", alice, "alice", "wrong", code)
+
+
+def test_saved_changes_wait_for_apply(tmp_path):
+    u = _setup_db(tmp_path)
+    state = wgauth.build_state(u)
+    # changes saved but not applied: the snapshot taken at the last apply still holds
+    u.set("network", "wg1", "ns_auth_mode", "key")
+    u.set("users", "ns_wgalice", "password", users.shadow_password("new password"))
+    alice = state["servers"]["wg1"]["peers"]["10.103.1.2"]
+    assert wgauth.check_login(state, "wg1", alice, "alice", PASSWORD)
+    assert "wg1" in state["servers"]
+    # applied
+    assert "wg1" not in wgauth.build_state(u)["servers"]
 
 
 def test_ensure_otp_secret(tmp_path):
@@ -309,6 +396,18 @@ def test_build_ruleset():
     )
 
 
+def test_build_block_ruleset():
+    lines = wgauth.build_block_ruleset(["wg1", "wg4"]).splitlines()
+    assert lines[:3] == ["add table inet ns_wgauth", "delete table inet ns_wgauth", "add table inet ns_wgauth"]
+    assert "add chain inet ns_wgauth forward { type filter hook forward priority -1; policy accept; }" in lines
+    for server in ("wg1", "wg4"):
+        assert f'add rule inet ns_wgauth input iifname "{server}" drop' in lines
+        assert f'add rule inet ns_wgauth forward iifname "{server}" drop' in lines
+        assert f'add rule inet ns_wgauth forward oifname "{server}" drop' in lines
+    # nothing that the login rules use: no sets, no symbolic priority, no reject
+    assert not any("@" in line or "filter -" in line or "reject" in line for line in lines)
+
+
 def test_table_matches():
     assert wgauth.table_matches(table_objects(["wg1", "wg4"]), ["wg1", "wg4"])
     assert not wgauth.table_matches(table_objects(["wg1"]), ["wg1", "wg4"])
@@ -328,63 +427,116 @@ def test_parse_sessions():
     }
 
 
-def test_apply_ruleset(tmp_path, mocker):
-    u = _setup_db(tmp_path)
+def test_check_script(mocker):
+    fake = FakeCommands()
+    mocker.patch("nethsec.wgauth._run", fake)
+    assert wgauth.check_script("add table inet ns_wgauth\n") is None
+    assert fake.calls[-1][0] == ["nft", "-c", "-f", "-"]
+    fake.failing = ("add table",)
+    assert wgauth.check_script("add table inet ns_wgauth\n") == "nft failed: Error: syntax error"
+    # nothing applied
+    assert fake.scripts() == []
+
+
+def test_apply_ruleset(tmp_path, mocker, run_dir):
+    state = wgauth.build_state(_setup_db(tmp_path))
     fake = FakeCommands(table=None)
     mocker.patch("nethsec.wgauth._run", fake)
-    assert wgauth.apply_ruleset(u) == ["wg1", "wg4", "wg5"]
+    assert wgauth.apply_ruleset(state) == ["wg1", "wg4", "wg5"]
     assert fake.scripts() == [wgauth.build_ruleset(["wg1", "wg4", "wg5"], 9443)]
     # complete table, nothing to do unless forced
     fake = FakeCommands(table=table_objects(["wg1", "wg4", "wg5"]))
     mocker.patch("nethsec.wgauth._run", fake)
-    wgauth.apply_ruleset(u, force=False)
+    wgauth.apply_ruleset(state, force=False)
     assert fake.scripts() == []
-    wgauth.apply_ruleset(u, force=True)
+    wgauth.apply_ruleset(state, force=True)
     assert len(fake.scripts()) == 1
 
 
-def test_apply_ruleset_removes_old_sets(tmp_path, mocker):
-    u = _setup_db(tmp_path)
+def test_apply_ruleset_removes_old_sets(tmp_path, mocker, run_dir):
+    state = wgauth.build_state(_setup_db(tmp_path))
     fake = FakeCommands(table=table_objects(["wg1", "wg2", "wg4", "wg5"]))
     mocker.patch("nethsec.wgauth._run", fake)
-    wgauth.apply_ruleset(u, force=False)
+    wgauth.apply_ruleset(state, force=False)
     assert ["nft", "delete", "set", "inet", "ns_wgauth", "auth_wg2"] in fake.commands("nft")
 
 
-def test_apply_ruleset_without_gated_servers(tmp_path, mocker):
+def test_apply_ruleset_without_gated_servers(tmp_path, mocker, run_dir):
     u = _setup_db(tmp_path)
     for server in ("wg1", "wg4", "wg5"):
         u.set("network", server, "ns_auth_mode", "key")
+    state = wgauth.build_state(u)
     fake = FakeCommands(table=table_objects(["wg1"]))
     mocker.patch("nethsec.wgauth._run", fake)
-    assert wgauth.apply_ruleset(u) == []
+    assert wgauth.apply_ruleset(state) == []
     assert fake.scripts() == ["delete table inet ns_wgauth\n"]
     fake = FakeCommands(table=None)
     mocker.patch("nethsec.wgauth._run", fake)
-    wgauth.apply_ruleset(u)
+    wgauth.apply_ruleset(state)
     assert fake.scripts() == []
 
 
-def test_apply_ruleset_failure(tmp_path, mocker):
-    u = _setup_db(tmp_path)
-
-    def failing(cmd, input=None):
-        if cmd == ["nft", "-f", "-"]:
-            return subprocess.CompletedProcess(cmd, 1, "", "Error: syntax error")
-        return subprocess.CompletedProcess(cmd, 1, "", "")
-
-    mocker.patch("nethsec.wgauth._run", failing)
+def test_apply_ruleset_failure_blocks(tmp_path, mocker, run_dir):
+    state = wgauth.build_state(_setup_db(tmp_path))
+    log = mocker.patch("nethsec.wgauth.log")
+    fake = FakeCommands(table=None, failing=("add table inet ns_wgauth\nadd set",))
+    mocker.patch("nethsec.wgauth._run", fake)
     with pytest.raises(RuntimeError):
-        wgauth.apply_ruleset(u)
+        wgauth.apply_ruleset(state)
+    # fail closed: the whole VPN of the gated servers is blocked
+    assert fake.scripts()[-1] == wgauth.build_block_ruleset(["wg1", "wg4", "wg5"])
+    assert wgauth.gate_status()["blocked"] == ["wg1", "wg4", "wg5"]
+    assert log.call_count == 1
+    # the next attempts don't log the same error again
+    with pytest.raises(RuntimeError):
+        wgauth.apply_ruleset(state, force=False)
+    assert log.call_count == 1
+    # the rules work again
+    fake.failing = ()
+    wgauth.apply_ruleset(state, force=False)
+    assert wgauth.gate_status()["blocked"] == []
+    assert fake.commands("ubus") == []
+
+
+def test_apply_ruleset_failure_keeps_complete_table(tmp_path, mocker, run_dir):
+    state = wgauth.build_state(_setup_db(tmp_path))
+    fake = FakeCommands(table=table_objects(["wg1", "wg4", "wg5"]), failing=("add table inet ns_wgauth\nadd set",))
+    mocker.patch("nethsec.wgauth._run", fake)
+    with pytest.raises(RuntimeError):
+        wgauth.apply_ruleset(state)
+    # the rules in place still gate every server and keep the sessions
+    assert len(fake.scripts()) == 1
+    assert wgauth.gate_status()["blocked"] == []
+
+
+def test_apply_ruleset_failure_takes_interfaces_down(tmp_path, mocker, run_dir):
+    state = wgauth.build_state(_setup_db(tmp_path))
+    mocker.patch("nethsec.wgauth.log")
+    fake = FakeCommands(table=None, failing=("add table",))
+    mocker.patch("nethsec.wgauth._run", fake)
+    with pytest.raises(RuntimeError):
+        wgauth.apply_ruleset(state)
+    downs = [json.loads(cmd[-1])["interface"] for cmd in fake.commands("ubus") if cmd[3] == "down"]
+    assert downs == ["wg1", "wg4", "wg5"]
+    fake.failing = ()
+    fake.calls = []
+    wgauth.apply_ruleset(state)
+    # the disabled server stays down
+    ups = [json.loads(cmd[-1])["interface"] for cmd in fake.commands("ubus") if cmd[3] == "up"]
+    assert ups == ["wg1", "wg5"]
+    assert wgauth.gate_status()["blocked"] == []
+
+
+def _alice(state):
+    return state["servers"]["wg1"]["peers"]["10.103.1.2"]
 
 
 def test_open_and_close_session(tmp_path, mocker, run_dir):
-    u = _setup_db(tmp_path)
-    fake = FakeCommands(table=table_objects(["wg1", "wg4", "wg5"]), endpoints="wg1\tKEY_ALICE\t203.0.113.7:40001\n")
+    state = wgauth.build_state(_setup_db(tmp_path))
+    fake = FakeCommands(table=table_objects(["wg1", "wg4", "wg5"]))
     mocker.patch("nethsec.wgauth._run", fake)
     mocker.patch("nethsec.wgauth.log")
-    alice = wgauth.check_credentials(u, "wg1", "wg1_ns_aaaaaaaa_peer", "alice", PASSWORD)
-    expires = wgauth.open_session(u, "wg1", "wg1_ns_aaaaaaaa_peer", "10.103.1.2", alice)
+    expires = wgauth.open_session(state, "wg1", "10.103.1.2", _alice(state), "203.0.113.7")
     assert expires - time.time() == pytest.approx(3600, abs=5)
     assert fake.scripts()[-1].splitlines() == [
         "add element inet ns_wgauth auth_wg1 { 10.103.1.2 }",
@@ -392,10 +544,10 @@ def test_open_and_close_session(tmp_path, mocker, run_dir):
         "add element inet ns_wgauth auth_wg1 { 10.103.1.2 timeout 3600s }",
     ]
     entry = wgauth.load_metadata()["wg1"]["10.103.1.2"]
-    assert entry["peer"] == "wg1_ns_aaaaaaaa_peer"
+    assert entry["peer"] == ALICE
+    assert entry["public_key"] == "KEY_ALICE"
     assert entry["user"] == "alice"
-    assert entry["fingerprint"] == wgauth.user_fingerprint(u, "wg1", alice)
-    # the public IP of the client, without the port
+    assert entry["fingerprint"] == _alice(state)["fingerprint"]
     assert entry["endpoint"] == "203.0.113.7"
 
     fake.table = table_objects(["wg1", "wg4", "wg5"], {"wg1": {"10.103.1.2": 3500}})
@@ -410,53 +562,60 @@ def test_open_and_close_session(tmp_path, mocker, run_dir):
 
 
 def test_open_session_rejects_bad_address(tmp_path, mocker, run_dir):
-    u = _setup_db(tmp_path)
+    state = wgauth.build_state(_setup_db(tmp_path))
     mocker.patch("nethsec.wgauth._run", FakeCommands(table=table_objects(["wg1"])))
     with pytest.raises(ValueError):
-        wgauth.open_session(u, "wg1", "wg1_ns_aaaaaaaa_peer", "10.103.1.2 }; flush ruleset", {"name": "alice"})
+        wgauth.open_session(state, "wg1", "10.103.1.2 }; flush ruleset", _alice(state))
 
 
-def _session(u, peer="wg1_ns_aaaaaaaa_peer", user="alice"):
-    alice = users.get_user_by_name(u, "alice", "wgauth_users")
-    return {"peer": peer, "user": user, "fingerprint": wgauth.user_fingerprint(u, "wg1", alice)}
+def _session(state, **changes):
+    alice = _alice(state)
+    entry = {"peer": ALICE, "public_key": "KEY_ALICE", "user": "alice", "fingerprint": alice["fingerprint"]}
+    entry.update(changes)
+    return entry
 
 
 def test_session_problem(tmp_path):
     u = _setup_db(tmp_path)
+    state = wgauth.build_state(u)
     now = int(time.time())
-    gated = wgauth.list_gated_servers(u)
-    entry = _session(u)
+    entry = _session(state)
     fresh = {"KEY_ALICE": now - 30}
 
-    def problem(server="wg1", address="10.103.1.2", entry=entry, handshakes=fresh, idle=300):
-        return wgauth.session_problem(u, server, address, entry, handshakes, now, idle, gated)
+    def problem(server="wg1", address="10.103.1.2", entry=entry, handshakes=fresh, blocked=(), state=state):
+        return wgauth.session_problem(state, server, address, entry, handshakes, now, blocked=blocked)
 
     assert problem() is None
     assert problem(entry=None) == "unknown_session"
     assert problem(server="wg2") == "server_changed"
     assert problem(address="10.103.1.9") == "peer_changed"
-    assert problem(entry=_session(u, peer="wg1_ns_bbbbbbbb_peer")) == "peer_changed"
-    assert problem(entry=_session(u, user="carol")) == "user_changed"
+    assert problem(entry=_session(state, peer="wg1_ns_bbbbbbbb_peer")) == "peer_changed"
+    # new keys generated for the peer
+    assert problem(entry=_session(state, public_key="OLD_KEY")) == "peer_changed"
+    assert problem(entry=_session(state, user="carol")) == "user_changed"
+    assert problem(blocked={ALICE}) == "blocked"
     assert problem(handshakes={"KEY_ALICE": now - 600}) == "disconnected"
     assert problem(handshakes={}) == "disconnected"
     # without handshake information, or with the check disabled, the session stays
     assert problem(handshakes=None) is None
-    assert problem(handshakes={}, idle=0) is None
+    assert problem(handshakes={}, state=dict(state, idle_timeout=0)) is None
 
     u.set("users", "ns_wgalice", "password", users.shadow_password("new password"))
-    assert problem() == "user_changed"
+    # not applied yet
+    assert problem() is None
+    assert problem(state=wgauth.build_state(u)) == "user_changed"
 
 
 def test_session_problem_server_and_peer_disabled(tmp_path):
     u = _setup_db(tmp_path)
+    state = wgauth.build_state(u)
     now = int(time.time())
-    gated = wgauth.list_gated_servers(u)
-    entry = _session(u)
-    u.set("network", "wg1_ns_aaaaaaaa_peer", "disabled", "1")
-    assert wgauth.session_problem(u, "wg1", "10.103.1.2", entry, None, now, 300, gated) == "peer_changed"
-    u.set("network", "wg1_ns_aaaaaaaa_peer", "disabled", "0")
+    entry = _session(state)
+    u.set("network", ALICE, "disabled", "1")
+    assert wgauth.session_problem(wgauth.build_state(u), "wg1", "10.103.1.2", entry, None, now) == "peer_changed"
+    u.set("network", ALICE, "disabled", "0")
     u.set("network", "wg1", "disabled", "1")
-    assert wgauth.session_problem(u, "wg1", "10.103.1.2", entry, None, now, 300, gated) == "server_changed"
+    assert wgauth.session_problem(wgauth.build_state(u), "wg1", "10.103.1.2", entry, None, now) == "server_changed"
 
 
 def test_endpoints(mocker):
@@ -468,17 +627,18 @@ def test_endpoints(mocker):
 
 
 def test_session_problem_endpoint(tmp_path):
-    u = _setup_db(tmp_path)
+    state = wgauth.build_state(_setup_db(tmp_path))
     now = int(time.time())
-    gated = wgauth.list_gated_servers(u)
-    entry = dict(_session(u), endpoint="203.0.113.7")
+    entry = _session(state, endpoint="203.0.113.7")
 
-    def problem(endpoints):
-        return wgauth.session_problem(u, "wg1", "10.103.1.2", entry, None, now, 300, gated, endpoints)
+    def problem(endpoints, lock="strict"):
+        return wgauth.session_problem(dict(state, lock_endpoint=lock), "wg1", "10.103.1.2", entry, None, now, endpoints)
 
     assert problem({"KEY_ALICE": "203.0.113.7"}) is None
-    # a copy of the configuration used from another network
+    # the same key from another public IP
     assert problem({"KEY_ALICE": "198.51.100.20"}) == "endpoint_changed"
+    # the session follows the peer
+    assert problem({"KEY_ALICE": "198.51.100.20"}, lock="roaming") is None
     # unknown endpoint, for example after an interface restart
     assert problem({}) is None
     # check disabled
@@ -490,6 +650,7 @@ def test_session_problem_endpoint(tmp_path):
 
 def test_reconcile_endpoint(tmp_path, mocker, run_dir):
     u = _setup_db(tmp_path)
+    state = wgauth.build_state(u)
     now = int(time.time())
     fake = FakeCommands(
         table=table_objects(["wg1", "wg4", "wg5"], {"wg1": {"10.103.1.2": 3000}}),
@@ -499,38 +660,45 @@ def test_reconcile_endpoint(tmp_path, mocker, run_dir):
     mocker.patch("nethsec.wgauth._run", fake)
     log = mocker.patch("nethsec.wgauth.log")
     # the endpoint wasn't known at login: recorded now
-    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(u)}})
-    assert wgauth.reconcile(u) == []
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state)}})
+    assert wgauth.reconcile(state) == []
     assert wgauth.load_metadata()["wg1"]["10.103.1.2"]["endpoint"] == "203.0.113.7"
     # the same key from another public IP ends the session
     fake.endpoints = "wg1\tKEY_ALICE\t198.51.100.20:51820\n"
-    assert wgauth.reconcile(u) == [("wg1", "10.103.1.2", "endpoint_changed")]
-    assert any("from 203.0.113.7, now 198.51.100.20" in call.args[0] for call in log.call_args_list)
+    assert wgauth.reconcile(state) == [("wg1", "10.103.1.2", "endpoint_changed")]
+    assert any("sends from 198.51.100.20, it logged in from 203.0.113.7" in call.args[0] for call in log.call_args_list)
+    # roaming: the session follows the peer
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state, endpoint="203.0.113.7")}})
+    u.set("ns-wgauth", "config", "lock_endpoint", "roaming")
+    state = wgauth.build_state(u)
+    assert wgauth.reconcile(state) == []
+    assert wgauth.load_metadata()["wg1"]["10.103.1.2"]["endpoint"] == "198.51.100.20"
     # the lock can be disabled
-    wgauth.save_metadata({"wg1": {"10.103.1.2": dict(_session(u), endpoint="203.0.113.7")}})
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state, endpoint="203.0.113.7")}})
     u.set("ns-wgauth", "config", "lock_endpoint", "0")
-    assert wgauth.reconcile(u) == []
+    state = wgauth.build_state(u)
+    assert wgauth.reconcile(state) == []
+    assert wgauth.load_metadata()["wg1"]["10.103.1.2"]["endpoint"] == "203.0.113.7"
 
 
 def test_session_survives_interface_restart(tmp_path):
-    u = _setup_db(tmp_path)
+    state = wgauth.build_state(_setup_db(tmp_path))
     now = int(time.time())
-    gated = wgauth.list_gated_servers(u)
-    entry = dict(_session(u), login=now - 3600, seen=now - 100)
+
+    def problem(entry):
+        return wgauth.session_problem(dict(state, idle_timeout=300), "wg1", "10.103.1.2", entry, {}, now)
+
     # the interface restarted: no handshake yet, but the latest one seen is recent
-    assert wgauth.session_problem(u, "wg1", "10.103.1.2", entry, {}, now, 300, gated) is None
-    entry["seen"] = now - 400
-    assert wgauth.session_problem(u, "wg1", "10.103.1.2", entry, {}, now, 300, gated) == "disconnected"
+    assert problem(_session(state, login=now - 3600, seen=now - 100)) is None
+    assert problem(_session(state, login=now - 3600, seen=now - 400)) == "disconnected"
     # a recent login counts as a handshake
-    entry = dict(_session(u), login=now - 10)
-    assert wgauth.session_problem(u, "wg1", "10.103.1.2", entry, {}, now, 300, gated) is None
+    assert problem(_session(state, login=now - 10)) is None
     # corrupted metadata counts as no handshake
-    entry = dict(_session(u), login="yesterday", seen=True)
-    assert wgauth.session_problem(u, "wg1", "10.103.1.2", entry, {}, now, 300, gated) == "disconnected"
+    assert problem(_session(state, login="yesterday", seen=True)) == "disconnected"
 
 
 def test_reconcile(tmp_path, mocker, run_dir):
-    u = _setup_db(tmp_path)
+    state = wgauth.build_state(_setup_db(tmp_path))
     now = int(time.time())
     fake = FakeCommands(
         table=table_objects(["wg1", "wg4", "wg5"], {"wg1": {"10.103.1.2": 3000, "10.103.1.9": 3000}}),
@@ -538,8 +706,8 @@ def test_reconcile(tmp_path, mocker, run_dir):
     )
     mocker.patch("nethsec.wgauth._run", fake)
     mocker.patch("nethsec.wgauth.log")
-    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(u), "10.103.1.7": _session(u)}})
-    ended = wgauth.reconcile(u)
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state), "10.103.1.7": _session(state)}})
+    ended = wgauth.reconcile(state)
     assert sorted(ended) == [("wg1", "10.103.1.7", "expired"), ("wg1", "10.103.1.9", "unknown_session")]
     assert list(wgauth.load_metadata()["wg1"]) == ["10.103.1.2"]
     # the latest handshake is remembered
@@ -547,9 +715,148 @@ def test_reconcile(tmp_path, mocker, run_dir):
     # the interface restarted: the handshakes are gone, the session stays
     fake.handshakes = ""
     fake.table = table_objects(["wg1", "wg4", "wg5"], {"wg1": {"10.103.1.2": 3000}})
-    assert wgauth.reconcile(u) == []
+    assert wgauth.reconcile(state) == []
     # the idle check uses the configured timeout
-    wgauth.save_metadata({"wg1": {"10.103.1.2": dict(_session(u), seen=now - 200)}})
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state, seen=now - 200)}})
     fake.handshakes = f"wg1\tKEY_ALICE\t{now - 200}\n"
-    assert wgauth.reconcile(u) == [("wg1", "10.103.1.2", "disconnected")]
+    assert wgauth.reconcile(state) == [("wg1", "10.103.1.2", "disconnected")]
     assert wgauth.load_metadata() == {}
+
+
+def test_reconcile_blocked(tmp_path, mocker, run_dir):
+    state = wgauth.build_state(_setup_db(tmp_path))
+    now = int(time.time())
+    fake = FakeCommands(
+        table=table_objects(["wg1", "wg4", "wg5"], {"wg1": {"10.103.1.2": 3000}}),
+        handshakes=f"wg1\tKEY_ALICE\t{now - 10}\n",
+    )
+    mocker.patch("nethsec.wgauth._run", fake)
+    mocker.patch("nethsec.wgauth.log")
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state)}})
+    wgauth.add_alert(ALICE, "KEY_ALICE", "copy", "alice", ["203.0.113.7"], block=True)
+    assert wgauth.reconcile(state) == [("wg1", "10.103.1.2", "blocked")]
+
+
+def test_alerts(tmp_path, mocker, run_dir):
+    u = _setup_db(tmp_path)
+    mocker.patch("nethsec.wgauth.log")
+    alice = _alice(wgauth.build_state(u))
+    assert wgauth.load_alerts() == {}
+    assert not wgauth.is_blocked(alice)
+    wgauth.add_alert(ALICE, "KEY_ALICE", "lockout", "alice", ["198.51.100.20", ""])
+    entry = wgauth.peer_alerts(wgauth.load_alerts(), ALICE, "KEY_ALICE")
+    assert entry["blocked"] is False
+    assert [(event["type"], event["addresses"]) for event in entry["events"]] == [("lockout", ["198.51.100.20"])]
+    assert not wgauth.is_blocked(alice)
+    wgauth.add_alert(ALICE, "KEY_ALICE", "copy", "alice", ["203.0.113.7", "198.51.100.20"], block=True)
+    assert wgauth.is_blocked(alice)
+    # the alerts belong to the keys of the peer
+    assert wgauth.peer_alerts(wgauth.load_alerts(), ALICE, "NEW_KEY") is None
+    assert not wgauth.is_blocked(dict(alice, public_key="NEW_KEY"))
+    # only the latest events are kept
+    for _ in range(wgauth.MAX_ALERTS + 5):
+        wgauth.add_alert(ALICE, "KEY_ALICE", "lockout", "alice", ["198.51.100.20"])
+    assert len(wgauth.load_alerts()[ALICE]["events"]) == wgauth.MAX_ALERTS
+    assert wgauth.is_blocked(alice)
+    assert wgauth.clear_alerts(ALICE)
+    assert not wgauth.clear_alerts(ALICE)
+    assert not wgauth.is_blocked(alice)
+
+
+def test_prune_alerts(tmp_path, mocker, run_dir):
+    u = _setup_db(tmp_path)
+    mocker.patch("nethsec.wgauth.log")
+    wgauth.add_alert(ALICE, "KEY_ALICE", "copy", "alice", ["203.0.113.7"])
+    wgauth.add_alert("wg1_ns_eeeeeeee_peer", "KEY_NOBODY", "copy", "", ["203.0.113.7"])
+    wgauth.add_alert("wg1_ns_ffffffff_peer", "KEY_REMOVED", "copy", "dave", ["203.0.113.7"])
+    # new keys for the peer without user, the last peer removed
+    u.set("network", "wg1_ns_eeeeeeee_peer", "public_key", "KEY_NEW")
+    wgauth.prune_alerts(u)
+    assert list(wgauth.load_alerts()) == [ALICE]
+
+
+def test_copy_detector():
+    detector = wgauth.CopyDetector()
+    now = 1000
+    assert detector.observe({"KEY": "203.0.113.7"}, now) == {}
+    # one device moving to other networks
+    assert detector.observe({"KEY": "198.51.100.20"}, now + 10) == {}
+    assert detector.observe({"KEY": "192.0.2.30"}, now + 20) == {}
+    assert detector.observe({"KEY": "192.0.2.40"}, now + 30) == {}
+    # two devices: the endpoint switches back and forth
+    detector = wgauth.CopyDetector()
+    detector.observe({"KEY": "203.0.113.7", "OTHER": "192.0.2.1"}, now)
+    assert detector.observe({"KEY": "198.51.100.20"}, now + 25) == {}
+    assert detector.observe({"KEY": "203.0.113.7"}, now + 50) == {}
+    assert detector.observe({"KEY": "198.51.100.20"}, now + 75) == {"KEY": ["198.51.100.20", "203.0.113.7"]}
+    # counted again from zero
+    assert detector.observe({"KEY": "203.0.113.7"}, now + 100) == {}
+    # changes older than the window don't count
+    detector = wgauth.CopyDetector()
+    detector.observe({"KEY": "203.0.113.7"}, now)
+    detector.observe({"KEY": "198.51.100.20"}, now + 10)
+    detector.observe({"KEY": "203.0.113.7"}, now + 400)
+    assert detector.observe({"KEY": "198.51.100.20"}, now + 410) == {}
+    # a key gone, for example a peer removed, is forgotten
+    detector.observe({}, now + 420)
+    assert detector.last == {} and detector.history == {}
+
+
+def test_report_copy(tmp_path, mocker, run_dir):
+    u = _setup_db(tmp_path)
+    state = wgauth.build_state(u)
+    fake = FakeCommands(table=table_objects(["wg1", "wg4", "wg5"], {"wg1": {"10.103.1.2": 3000}}))
+    mocker.patch("nethsec.wgauth._run", fake)
+    log = mocker.patch("nethsec.wgauth.log")
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state)}})
+    assert wgauth.report_copy(state, "KEY_UNKNOWN", ["203.0.113.7"]) is None
+    assert wgauth.report_copy(state, "KEY_ALICE", ["198.51.100.20", "203.0.113.7"]) == ALICE
+    assert any("possible copy of the configuration of peer" in call.args[0] for call in log.call_args_list)
+    assert wgauth.load_metadata() == {}
+    events = wgauth.load_alerts()[ALICE]["events"]
+    assert [(event["type"], event["addresses"]) for event in events] == [("copy", ["198.51.100.20", "203.0.113.7"])]
+    # alert only by default
+    assert not wgauth.is_blocked(_alice(state))
+    # seen again soon: the session ends, but no new alert
+    wgauth.report_copy(state, "KEY_ALICE", ["198.51.100.20", "203.0.113.7"])
+    assert len(wgauth.load_alerts()[ALICE]["events"]) == 1
+    # with block_copies the peer is blocked, even if already reported
+    u.set("ns-wgauth", "config", "block_copies", "1")
+    state = wgauth.build_state(u)
+    wgauth.report_copy(state, "KEY_ALICE", ["198.51.100.20", "203.0.113.7"])
+    assert wgauth.is_blocked(_alice(state))
+
+
+def test_login_failures():
+    failures = wgauth.LoginFailures()
+    now = 1000
+    for attempt in range(4):
+        assert failures.add(ALICE, "198.51.100.20", now + attempt, 5, 900) == []
+    assert failures.locked_until(ALICE, "198.51.100.20", now + 4, 5, 900) is None
+    # the fifth failure locks out that IP
+    assert failures.add(ALICE, "198.51.100.20", now + 4, 5, 900) == ["198.51.100.20"]
+    assert failures.locked_until(ALICE, "198.51.100.20", now + 5, 5, 900) == now + 4 + 900
+    # the real user, from another network, can still log in
+    assert failures.locked_until(ALICE, "203.0.113.7", now + 5, 5, 900) is None
+    # other peers aren't affected
+    assert failures.locked_until("wg1_other_peer", "198.51.100.20", now + 5, 5, 900) is None
+    # the lockout ends
+    assert failures.locked_until(ALICE, "198.51.100.20", now + 905, 5, 900) is None
+    # a successful login forgets the failures of its IP only
+    failures.add(ALICE, "203.0.113.7", now + 906, 5, 900)
+    failures.add(ALICE, "198.51.100.21", now + 906, 5, 900)
+    failures.success(ALICE, "203.0.113.7")
+    assert [source for _, source in failures.failures[ALICE]] == ["198.51.100.21"]
+
+
+def test_login_failures_from_many_ips():
+    failures = wgauth.LoginFailures()
+    now = 1000
+    failures.success(ALICE, "203.0.113.7")
+    locked = []
+    for attempt in range(5 * wgauth.PEER_FAILURE_FACTOR):
+        locked = failures.add(ALICE, f"198.51.100.{attempt}", now + attempt, 5, 900)
+    # too many failures for the peer: every IP is locked out but the one of the latest login
+    assert len(locked) == 5 * wgauth.PEER_FAILURE_FACTOR
+    assert failures.locked_until(ALICE, "192.0.2.99", now + 30, 5, 900) is not None
+    assert failures.locked_until(ALICE, "203.0.113.7", now + 30, 5, 900) is None

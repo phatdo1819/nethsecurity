@@ -10,6 +10,7 @@ START=15
 USE_PROCD=1
 
 start_service() {
+	# the daemon works on the configuration applied here, changes not applied yet don't reach it
 	/usr/sbin/ns-wgauth sync || logger -t ns-wgauth -p daemon.err "sync failed, the daemon will retry"
 	# the daemon runs only while a server requires the login, the triggers below start it when needed
 	/usr/sbin/ns-wgauth needed || return 0
@@ -22,6 +23,7 @@ start_service() {
 }
 
 service_triggers() {
-	# reload runs start_service again: new servers, peers, users and passwords are applied
+	# the configuration is applied with a reload, that runs start_service again: new servers, peers, users and
+	# passwords take effect
 	procd_add_reload_trigger "network" "users" "ns-wgauth"
 }

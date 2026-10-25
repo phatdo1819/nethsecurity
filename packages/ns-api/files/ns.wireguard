@@ -53,14 +53,15 @@ def generate_wireguard_keys():
 def list_servers():
     u = EUci()
     ret = []
-    # Fetch active peers and login sessions once for all servers
+    # Fetch active peers, login sessions and alerts once for all servers
     peers_status = __active_peers()
-    sessions = wgauth.list_sessions()
+    gate = wgauth.gate_status()
+    alerts = wgauth.load_alerts()
     interfaces = utils.get_all_by_type(u, "network", "interface")
     for i in interfaces:
         interface = interfaces[i]
         if interface.get("proto") == "wireguard" and interface.get("ns_type", '') == 'server':
-            ret.append(__get_server_configuration(u, i, peers_status, sessions))
+            ret.append(__get_server_configuration(u, i, peers_status, gate, alerts))
     return ret
 
 
@@ -669,8 +670,20 @@ def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_nam
     return config
 
 
-def __get_server_configuration(u, instance, peers_status, sessions):
-    """Get server configuration with peers, reusing EUci instance and pre-fetched peer status and sessions."""
+def __get_peer_alerts(alerts, peer, public_key):
+    entry = wgauth.peer_alerts(alerts, peer, public_key) or {}
+    events = []
+    for event in reversed(entry.get('events', [])):
+        events.append({
+            "time": datetime.fromtimestamp(event.get('time', 0), tz=timezone.utc).isoformat(),
+            "type": event.get('type', ''),
+            "addresses": event.get('addresses', []),
+        })
+    return bool(entry.get('blocked')), events
+
+
+def __get_server_configuration(u, instance, peers_status, gate, alerts):
+    """Get server configuration with peers, reusing EUci instance and pre-fetched peer status, sessions and alerts."""
     if u.get('network', instance, default=None) is None:
         return utils.generic_error("instance_not_found")
 
@@ -691,6 +704,7 @@ def __get_server_configuration(u, instance, peers_status, sessions):
     # login with user credentials, see nethsec.wgauth
     gated = wgauth.is_gated(u, instance)
     login_url = wgauth.get_login_url(u, instance) if gated else None
+    sessions = gate['sessions']
     server_sessions = sessions.get(instance, {})
     now = datetime.now(timezone.utc).timestamp()
 
@@ -718,6 +732,8 @@ def __get_server_configuration(u, instance, peers_status, sessions):
         if peer["authenticated"]:
             peer["auth_expires"] = datetime.fromtimestamp(now + server_sessions[reserved_ip], tz=timezone.utc).isoformat()
         public_key = u.get('network', p, 'public_key', dtype=str, default='')
+        # suspected copies of the configuration and lockouts, see nethsec.wgauth
+        peer["blocked"], peer["alerts"] = __get_peer_alerts(alerts, p, public_key)
         if public_key in peers_status:
             peer["active"] = peers_status[public_key]["active"]
             if 'latest_handshake' in peers_status[public_key]:
@@ -741,7 +757,9 @@ def __get_server_configuration(u, instance, peers_status, sessions):
         "auth_timeout": wgauth.get_session_timeout(u, instance),
         "login_url": login_url or '',
         # false when the login is required but the firewall doesn't enforce it, see ns-wgauth
-        "auth_enforced": gated and instance in sessions
+        "auth_enforced": gated and instance in sessions,
+        # true when the login rules couldn't be loaded and the firewall blocks the whole VPN instead
+        "auth_blocked": gated and instance in gate['blocked']
     }
 
 
@@ -1009,6 +1027,39 @@ def download_peer_2fa(args):
     return {"data": p.stdout}
 
 
+def regenerate_peer_keys(args):
+    """
+    Give a server peer new keys, and a new pre-shared key if it has one: once applied, the current configuration
+    of the peer, and every copy of it, stops working.
+    """
+    e_uci = EUci()
+    _instance, err = __get_server_peer(e_uci, args)
+    if err:
+        return err
+    private_key, public_key = generate_wireguard_keys()
+    if not private_key or not public_key:
+        return utils.generic_error('key_generation_failed')
+    e_uci.set('network', args['id'], 'private_key', private_key)
+    e_uci.set('network', args['id'], 'public_key', public_key)
+    if e_uci.get('network', args['id'], 'preshared_key', default='') != '':
+        psk = subprocess.run(["wg", "genpsk"], capture_output=True, text=True).stdout.strip()
+        e_uci.set('network', args['id'], 'preshared_key', psk)
+    e_uci.save('network')
+    return {"result": "success"}
+
+
+def clear_peer_alerts(args):
+    e_uci = EUci()
+    _instance, err = __get_server_peer(e_uci, args)
+    if err:
+        return err
+    try:
+        wgauth.clear_alerts(args['id'])
+    except (OSError, RuntimeError):
+        return utils.generic_error('clear_alerts_failed')
+    return {"result": "success"}
+
+
 cmd = sys.argv[1]
 
 if cmd == 'list':
@@ -1071,6 +1122,8 @@ if cmd == 'list':
         "delete-peer": {"id": "peerid"},
         "logout-peer": {"id": "peerid"},
         "download-peer-2fa": {"id": "peerid"},
+        "regenerate-peer-keys": {"id": "peerid"},
+        "clear-peer-alerts": {"id": "peerid"},
         "list-tunnels": {},
         "add-tunnel": {
             "enabled": True,
@@ -1139,6 +1192,12 @@ else:
     elif action == 'download-peer-2fa':
         args = json.loads(sys.stdin.read())
         ret = download_peer_2fa(args)
+    elif action == 'regenerate-peer-keys':
+        args = json.loads(sys.stdin.read())
+        ret = regenerate_peer_keys(args)
+    elif action == 'clear-peer-alerts':
+        args = json.loads(sys.stdin.read())
+        ret = clear_peer_alerts(args)
     elif action == 'list-tunnels':
         ret = {"tunnels": list_tunnels()}
     elif action == 'add-tunnel':

@@ -894,6 +894,9 @@ paths:
                         auth_enforced:
                           type: boolean
                           description: False when the login is required but the firewall doesn't enforce it
+                        auth_blocked:
+                          type: boolean
+                          description: True when the login rules couldn't be loaded and the whole VPN is blocked
                         peers:
                           type: array
                           items:
@@ -917,6 +920,26 @@ paths:
                                 type: string
                                 format: date-time
                                 description: Present only while authenticated
+                              blocked:
+                                type: boolean
+                                description: Blocked after a suspected copy of its configuration
+                              alerts:
+                                type: array
+                                description: Suspected copies and lockouts, newest first
+                                items:
+                                  type: object
+                                  properties:
+                                    time:
+                                      type: string
+                                      format: date-time
+                                    type:
+                                      type: string
+                                      enum: [copy, lockout]
+                                    addresses:
+                                      type: array
+                                      items:
+                                        type: string
+                                      example: ["198.51.100.20", "203.0.113.7"]
   POST /ubus/ns.wireguard/add-server:
     post:
       summary: Add a WireGuard server
@@ -1061,3 +1084,51 @@ paths:
                         type: string
                         description: SVG image
                   - $ref: "#/components/schemas/ValidationError"
+  POST /ubus/ns.wireguard/regenerate-peer-keys:
+    post:
+      summary: Give a server peer new keys
+      description: >-
+        New private and public keys, and a new pre-shared key if the peer has one. Once committed, the current
+        configuration of the peer and every copy of it stop working; the alerts of the peer are dropped.
+      operationId: ns.wireguard.regenerate-peer-keys
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WireGuardPeerId"
+      responses:
+        "200":
+          description: Keys saved, to be committed, or validation failed
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WireGuardResult"
+                  - $ref: "#/components/schemas/ValidationError"
+                  - $ref: "#/components/schemas/Error"
+  POST /ubus/ns.wireguard/clear-peer-alerts:
+    post:
+      summary: Forget the alerts of a peer and unblock it
+      description: No configuration changes, no commit needed.
+      operationId: ns.wireguard.clear-peer-alerts
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WireGuardPeerId"
+      responses:
+        "200":
+          description: Alerts cleared, or there were none
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WireGuardResult"
+                  - $ref: "#/components/schemas/ValidationError"
+                  - $ref: "#/components/schemas/Error"

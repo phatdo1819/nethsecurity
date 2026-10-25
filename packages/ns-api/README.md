@@ -8689,6 +8689,14 @@ Response example:
           "user": "tommaso",
           "authenticated": true,
           "auth_expires": "2025-09-30T16:52:29+00:00",
+          "blocked": false,
+          "alerts": [
+            {
+              "time": "2025-09-29T19:10:05+00:00",
+              "type": "lockout",
+              "addresses": ["198.51.100.20"]
+            }
+          ],
           "active": true,
           "latest_handshake": "2025-09-30T08:52:29+00:00"
         }
@@ -8699,7 +8707,8 @@ Response example:
       "user_db": "main",
       "auth_timeout": 28800,
       "login_url": "http://10.1.122.1:8181/",
-      "auth_enforced": true
+      "auth_enforced": true,
+      "auth_blocked": false
     }
   ]
 }
@@ -8712,11 +8721,17 @@ Login fields of a server:
 - `login_url`: the login page of the peers, empty in `key` mode
 - `auth_enforced`: `false` if the server requires the login but the firewall doesn't enforce it (the `ns-wgauth`
   service isn't running or failed): the peers can use the VPN without logging in
+- `auth_blocked`: `true` if the firewall couldn't load the login rules and blocks all the traffic of the server
+  instead: nobody can use the VPN
 
 Login fields of a peer:
 - `user`: the linked user, empty if there is none
 - `authenticated`: `true` while the user is logged in
 - `auth_expires`: when the session ends, only if `authenticated` is `true`
+- `blocked`: `true` if the peer is blocked after a suspected copy of its configuration (`block_copies` in
+  `/etc/config/ns-wgauth`): it can't log in until its alerts are cleared or it gets new keys
+- `alerts`: suspected copies of the configuration (`type` `copy`, the public IPs it was used from at the same time)
+  and lockouts after too many failed logins (`type` `lockout`, the public IPs locked out), newest first
 
 
 ### add-server
@@ -8868,6 +8883,36 @@ Response example:
 ```
 
 Validation errors of `id`: `required`, `invalid`, `otp_not_required`, `user_not_found`, `2fa_download_failed`.
+
+### regenerate-peer-keys
+
+Give a server peer new private and public keys, and a new pre-shared key if it has one. After the changes are
+committed, the current configuration of the peer and every copy of it stop working: download the new configuration
+from `list-servers` and give it to the user. Its alerts and its block are dropped:
+```
+api-cli ns.wireguard regenerate-peer-keys --data '{"id": "wg1_ns_76e103f5_peer"}'
+```
+
+Response example:
+```json
+{"result": "success"}
+```
+
+Errors: validation error `id` `required` or `invalid`, error `key_generation_failed`.
+
+### clear-peer-alerts
+
+Forget the alerts of a peer and unblock it. It changes no configuration, no commit is needed:
+```
+api-cli ns.wireguard clear-peer-alerts --data '{"id": "wg1_ns_76e103f5_peer"}'
+```
+
+Response example:
+```json
+{"result": "success"}
+```
+
+Errors: validation error `id` `required` or `invalid`, error `clear_alerts_failed`.
 
 
 ### list-tunnels
