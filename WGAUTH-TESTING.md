@@ -91,6 +91,9 @@ Don't forward the login port 8181: the login page is reached through the tunnel.
    - **Authentication**: *Key, user password and OTP*
    - **Users database**: *Local database*
    - **Session length**: 8 hours
+   - **Advanced settings > DNS servers**: an address the peers reach through the tunnel, for example the LAN address
+     of the firewall. The redirect of step 6 needs it, unless the peers route all their traffic through the VPN.
+     Configurations downloaded before this change have no DNS line: download them again.
    Editing a server that already has peers, the form lists the peers without a user: they can't log in until you
    choose one for each of them.
 3. Save, then apply the changes with the button at the top of the page.
@@ -120,8 +123,14 @@ On a client (Windows, macOS, Linux, Android or iOS WireGuard app), import the co
    reachable only through the tunnel, which encrypts it.
 3. A wrong password: **Wrong username, password or OTP code**.
 4. The right username, password and OTP code: **You are logged in as alice**, with the end of the session.
+   The browser offers to save the password: accept, the next time only the OTP code is needed.
 5. The LAN works now. In the web UI the peer shows **Logged in until ...**.
 6. **Log out** on the page: the LAN stops answering.
+7. **The redirect**: still logged out, open `http://neverssl.com` (type the whole address, with `http://`): the login
+   page opens instead. `https://` sites fail, as on a hotel Wi-Fi. After the login, `http://neverssl.com` shows the
+   real site.
+8. **Home screen**, on a phone: Safari > Share > **Add to Home Screen**, or Chrome > menu > **Add to Home screen**.
+   The icon is a white keyhole on blue and opens the login page.
 
 On the firewall:
 
@@ -167,12 +176,14 @@ while the laptop is on Wi-Fi. The detection needs the two devices active at the 
 ```sh
 uci set ns-wgauth.config.lock_endpoint='roaming'  # the session follows a user who changes network
 uci set ns-wgauth.config.block_copies='1'         # block a peer whose configuration is used twice at once
+uci set ns-wgauth.config.idle_timeout='14400'     # log in once per workday: 4 hours without handshake
 uci commit ns-wgauth
 reload_config
 ```
 
-Options: `port` (8181), `idle_timeout` (300 seconds, 0 disables it), `lock_endpoint` (`1`, `roaming` or `0`),
-`detect_copies` (1), `block_copies` (0), `max_failures` (5 per public IP), `lockout_time` (900 seconds).
+Options: `port` (8181), `redirect` (1), `idle_timeout` (300 seconds, 0 disables it), `lock_endpoint` (`1`,
+`roaming` or `0`), `detect_copies` (1), `block_copies` (0), `max_failures` (5 per public IP), `lockout_time`
+(900 seconds). If the redirect causes any trouble, `uci set ns-wgauth.config.redirect='0'` turns it off.
 
 ## Update without rebuilding
 
@@ -185,6 +196,7 @@ NETHSEC=$(ssh $FW "python3 -c 'import nethsec, os; print(os.path.dirname(nethsec
 scp packages/python3-nethsec/src/nethsec/wgauth/__init__.py $FW:$NETHSEC/wgauth/__init__.py
 scp packages/ns-wgauth/files/ns-wgauth.py $FW:/usr/sbin/ns-wgauth
 scp packages/ns-wgauth/files/www/* $FW:/www-wgauth/
+scp packages/ns-wgauth/files/config $FW:/tmp/ns-wgauth.default   # new options: compare with /etc/config/ns-wgauth
 scp packages/ns-api/files/ns.wireguard $FW:/usr/libexec/rpcd/ns.wireguard
 ssh $FW "/etc/init.d/ns-wgauth restart && ns-wgauth check"
 ```
@@ -222,3 +234,6 @@ follow [FORK-TESTING.md](FORK-TESTING.md).
 - Local users databases only, not LDAP.
 - Sessions are lost on reboot or HA failover: users log in again. Warnings and blocks stay.
 - Two devices behind the same public IP can't be told apart: neither the IP lock nor the copy detection see them.
+- The standard WireGuard apps can't open the login page by themselves: bookmark, home-screen icon or redirect.
+- Firefox may keep for a minute the names opened just before the login: reload the page if a site doesn't open
+  right after logging in.
