@@ -1037,12 +1037,15 @@ def regenerate_peer_keys(args):
     if err:
         return err
     private_key, public_key = generate_wireguard_keys()
-    if not private_key or not public_key:
+    psk = None
+    if e_uci.get('network', args['id'], 'preshared_key', default='') != '':
+        psk = subprocess.run(["wg", "genpsk"], capture_output=True, text=True).stdout.strip()
+    # an empty key would break the peer, or silently drop its pre-shared key
+    if not private_key or not public_key or psk == '':
         return utils.generic_error('key_generation_failed')
     e_uci.set('network', args['id'], 'private_key', private_key)
     e_uci.set('network', args['id'], 'public_key', public_key)
-    if e_uci.get('network', args['id'], 'preshared_key', default='') != '':
-        psk = subprocess.run(["wg", "genpsk"], capture_output=True, text=True).stdout.strip()
+    if psk is not None:
         e_uci.set('network', args['id'], 'preshared_key', psk)
     e_uci.save('network')
     return {"result": "success"}
