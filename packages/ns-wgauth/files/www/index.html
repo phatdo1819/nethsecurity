@@ -8,7 +8,12 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="referrer" content="no-referrer" />
+    <meta name="theme-color" content="#0369a1" />
+    <meta name="apple-mobile-web-app-title" content="VPN login" />
     <title>VPN login</title>
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="icon-192.png" />
+    <link rel="manifest" href="manifest.json" />
     <link rel="stylesheet" href="style.css" />
     <script src="app.js" defer></script>
   </head>
@@ -56,6 +61,10 @@
       <section id="session" hidden>
         <p class="success" role="status">You are logged in as <strong id="user"></strong>.</p>
         <p class="muted">The session ends <span id="expires"></span>. Log in again after that to keep using the VPN.</p>
+        <p class="muted">
+          Add this page to your bookmarks or to the home screen of your phone, to open it quickly after connecting.
+          Your browser can also remember your username and password.
+        </p>
         <button id="logout" type="button" class="secondary">Log out</button>
       </section>
     </main>

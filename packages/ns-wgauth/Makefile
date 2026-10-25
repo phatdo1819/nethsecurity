@@ -70,6 +70,8 @@ define Package/ns-wgauth/install
 	$(INSTALL_CONF) ./files/config $(1)/etc/config/ns-wgauth
 	$(INSTALL_BIN) ./files/ns-wgauth.init $(1)/etc/init.d/ns-wgauth
 	$(INSTALL_DATA) ./files/www/index.html ./files/www/app.js ./files/www/style.css $(1)/www-wgauth
+	$(INSTALL_DATA) ./files/www/manifest.json ./files/www/icon.svg $(1)/www-wgauth
+	$(INSTALL_DATA) ./files/www/icon-192.png ./files/www/icon-512.png $(1)/www-wgauth
 	# the alerts block the peers whose configuration was copied: they must survive an upgrade
 	$(INSTALL_CONF) ./files/ns-wgauth.keep $(1)/lib/upgrade/keep.d/ns-wgauth
 endef

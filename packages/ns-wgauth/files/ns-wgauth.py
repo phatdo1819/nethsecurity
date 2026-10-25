@@ -91,6 +91,20 @@ server {{
 }}
 """
 
+# nftables redirects here the web requests of the peers that aren't logged in: $server_addr is then the address of
+# the WireGuard server the request came through
+NGINX_REDIRECT_TEMPLATE = """
+server {{
+	listen {redirect_port};
+	server_name _;
+	access_log off;
+	error_log syslog:server=unix:/dev/log,nohostname;
+	server_tokens off;
+	add_header Cache-Control "no-store" always;
+	return 302 http://$server_addr:{port}/;
+}}
+"""
+
 
 def iso_time(timestamp):
     return datetime.fromtimestamp(timestamp, tz=UTC).isoformat()
@@ -126,6 +140,8 @@ def update_nginx(state):
     content = None
     if state["servers"]:
         content = NGINX_TEMPLATE.format(port=state["port"], root=WEB_ROOT, socket=SOCKET)
+        if state["redirect"]:
+            content += NGINX_REDIRECT_TEMPLATE.format(port=state["port"], redirect_port=state["redirect_port"])
     previous = read_file(NGINX_CONF)
     if previous == content:
         return
@@ -141,10 +157,24 @@ def update_nginx(state):
         subprocess.run(["/etc/init.d/nginx", "reload"], check=False, capture_output=True)
 
 
+# one (modification time, snapshot) pair, replaced as a whole: the threads share it
+_state_cache = [(None, None)]
+
+
 def current_state():
-    """The configuration applied last, see wgauth.build_state."""
+    """The configuration applied last, see wgauth.build_state, read again only when `sync` writes it."""
+    try:
+        stamp = os.stat(wgauth.STATE_FILE).st_mtime_ns
+    except OSError:
+        stamp = None
+    cached_stamp, cached_state = _state_cache[0]
+    if stamp is not None and cached_stamp == stamp:
+        return cached_state
     state = wgauth.load_state()
-    return state if state is not None else wgauth.build_state(EUci())
+    if state is None:
+        return wgauth.build_state(EUci())
+    _state_cache[0] = (stamp, state)
+    return state
 
 
 def sync(apply=True):
@@ -390,6 +420,61 @@ def monitor(service, stop):
             run_logged(errors, "sync", lambda: sync(apply=False))
 
 
+def dns_reply(state, source, query):
+    """
+    Answer a DNS query that nftables redirected from a peer that isn't logged in, see wgauth.dns_answer.
+    Returns None for clients that aren't such a peer: nobody else must get these answers.
+    """
+    if not state["redirect"]:
+        return None
+    server, _peer = wgauth.find_peer(state, source)
+    if server is None:
+        return None
+    return wgauth.dns_answer(query, state["servers"][server]["address"])
+
+
+def open_dns_socket(port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("0.0.0.0", port))
+    except OSError:
+        sock.close()
+        raise
+    sock.settimeout(1)
+    return sock
+
+
+def serve_dns(stop):
+    port, sock, failed = None, None, None
+    while not stop.is_set():
+        # the port can change when the configuration is applied
+        wanted = current_state()["dns_port"]
+        if wanted != port or sock is None:
+            if sock is not None:
+                sock.close()
+            port, sock = wanted, None
+            try:
+                sock = open_dns_socket(wanted)
+            except OSError as error:
+                if failed != wanted:
+                    wgauth.log(f"cannot answer DNS on port {wanted}: {error}", syslog.LOG_ERR)
+                    failed = wanted
+                stop.wait(SYNC_INTERVAL)
+                continue
+            failed = None
+        try:
+            query, (source, source_port) = sock.recvfrom(512)
+            reply = dns_reply(current_state(), source, query)
+            if reply is not None:
+                sock.sendto(reply, (source, source_port))
+        except TimeoutError:
+            continue
+        except Exception as error:  # noqa: BLE001 a bad packet must not stop the answers
+            wgauth.log(f"DNS answer failed: {error}", syslog.LOG_ERR)
+    if sock is not None:
+        sock.close()
+
+
 def serve():
     try:
         os.unlink(SOCKET)
@@ -401,6 +486,7 @@ def serve():
     server.service = LoginService()
     stop = threading.Event()
     threading.Thread(target=monitor, args=(server.service, stop), daemon=True).start()
+    threading.Thread(target=serve_dns, args=(stop,), daemon=True).start()
     wgauth.log("login service started")
     try:
         server.serve_forever()
@@ -433,8 +519,9 @@ def check():
     servers = sorted(state["servers"])
     # without gated servers the rules are tested with a sample interface name
     sample = servers or ["wg1"]
+    redirect = (state["redirect_port"], state["dns_port"]) if state["redirect"] else None
     for name, script in (
-        ("login rules", wgauth.build_ruleset(sample, state["port"])),
+        ("login rules", wgauth.build_ruleset(sample, state["port"], redirect)),
         ("fallback rules", wgauth.build_block_ruleset(sample)),
     ):
         error = wgauth.check_script(script)
@@ -450,7 +537,7 @@ def check():
     blocked = wgauth.gate_status()["blocked"]
     if blocked:
         report("ERROR", f"the VPN of {', '.join(blocked)} is blocked: the login rules couldn't be loaded")
-    elif wgauth.table_matches(wgauth.read_table(), servers):
+    elif wgauth.table_matches(wgauth.read_table(), servers, wgauth.ruleset_for(state)):
         report("OK", f"the gate is in place for {', '.join(servers)}")
     else:
         report("ERROR", f"the gate is missing or incomplete for {', '.join(servers)}")
@@ -458,6 +545,12 @@ def check():
         report("OK", f"the login page is configured on port {state['port']}")
     else:
         report("ERROR", "the login page isn't configured in nginx")
+    if state["redirect"]:
+        report(
+            "OK",
+            f"before the login, plain http:// addresses lead to the login page (web port {state['redirect_port']}, "
+            f"DNS port {state['dns_port']}), if the DNS queries of the peers go through the tunnel",
+        )
     report("OK" if service_listening() else "ERROR", f"the login service answers on {SOCKET}")
     endpoints = wgauth.read_endpoints() or {}
     for server in servers:
