@@ -50,8 +50,10 @@ Not covered:
 1. The administrator links each peer to a user and gives the user the peer configuration, as before.
    The configuration contains the login address as a comment.
 2. The user activates the tunnel in the WireGuard app.
-3. The user opens the login page, for example `http://10.103.1.1:8181/`, and enters username, password and,
-   if required, the OTP code. Until then only the login page answers: everything else is rejected.
+3. The user opens the login page, for example `http://10.103.1.1:8181/`, from a bookmark or a home-screen icon, or
+   opens any plain `http://` address and is redirected there. They enter username, password and, if required, the
+   OTP code; the browser can remember the username and password. Until then only the login page answers: everything
+   else is rejected.
 4. After the login the traffic flows. The page shows when the session expires and has a log-out button.
 5. The session ends when it expires (8 hours by default), when the peer doesn't handshake for 5 minutes,
    when the peer shows up from another public IP, when the configuration seems used by two devices, when the user
@@ -70,7 +72,10 @@ comment line, ignored by the apps:
 
 The trade-off is that the app can't ask for credentials:
 
-- the user must open the page after connecting
+- the user must open the page after connecting: the apps can't run anything when the tunnel comes up, and the
+  operating systems show their captive portal prompt only for Wi-Fi networks. The page has an icon and a web app
+  manifest for the home screen, its form is marked for password managers, and the redirect described in
+  [Rules](#rules) leads any plain `http://` address to it
 - when the session expires, the app still shows the tunnel as connected while the traffic is rejected
 - a phone that stops sending keepalives while asleep is logged out after the idle timeout
 
@@ -120,6 +125,7 @@ OTP, or when a server starts requiring it.
 ```
 config main 'config'
 	option port '8181'
+	option redirect '1'
 	option idle_timeout '300'
 	option lock_endpoint '1'
 	option detect_copies '1'
@@ -128,6 +134,8 @@ config main 'config'
 	option lockout_time '900'
 ```
 
+- `redirect`: before the login, lead plain `http://` addresses to the login page, see [Rules](#rules). The
+  optional `redirect_port` (8180) and `dns_port` (8153) are the local ports used for it
 - `lock_endpoint`: `1` (strict), `roaming` or `0`, see [Copied configurations](#copied-configurations)
 - `detect_copies`: watch the endpoints for a configuration used by two devices at once
 - `block_copies`: block such a peer until an administrator acts, instead of only ending its session
@@ -155,10 +163,11 @@ Components:
 - `table inet ns_wgauth`: an nftables table owned by the feature, with one set of logged-in addresses
   per gated server and the chains enforcing it
 - an nginx server block on the login port (`/etc/nginx/conf.d/ns-wgauth.conf`): it serves the static page from
-  `/www-wgauth` and proxies `/api/` to the daemon, adding request size limits and rate limiting (`limit_req`)
+  `/www-wgauth` and proxies `/api/` to the daemon, adding request size limits and rate limiting (`limit_req`).
+  With the redirect, a second server block on `redirect_port` sends the web requests made before the login to it
 - the `ns-wgauth` daemon (`ns-wgauth serve`, Python, on `/var/run/ns-wgauth.sock`): it checks credentials, adds
-  and removes set elements, every 5 seconds watches the endpoints for copied configurations and every 15 seconds
-  ends the sessions that are no longer valid
+  and removes set elements, answers the DNS queries redirected before the login, every 5 seconds watches the
+  endpoints for copied configurations and every 15 seconds ends the sessions that are no longer valid
 - `ns-wgauth sync`: it applies the configuration: it takes the snapshot the daemon works on, builds the table and
   the nginx server, and ends the sessions that are no longer valid
 - `ns-wgauth check`: it tests on the firewall what can't be tested elsewhere, see [Failing closed](#failing-closed)
@@ -187,8 +196,8 @@ relies on this with its own `table inet banIP`. Only `fw4 flush` deletes every t
 
 ### Rules
 
-`ns-wgauth sync` generates the table from the gated servers, enabled or not. With one gated server `wg1` and the
-login port 8181:
+`ns-wgauth sync` generates the table from the gated servers, enabled or not. With one gated server `wg1`, the
+login port 8181 and the redirect on:
 
 ```
 table inet ns_wgauth {
@@ -202,9 +211,16 @@ table inet ns_wgauth {
 		flags timeout
 	}
 
+	chain prerouting {
+		type nat hook prerouting priority dstnat - 1; policy accept;
+		iifname "wg1" ip saddr != @auth_wg1 udp dport 53 limit rate 100/second redirect to :8153
+		iifname "wg1" ip saddr != @auth_wg1 tcp dport 80 redirect to :8180
+	}
+
 	chain input {
 		type filter hook input priority filter - 1; policy accept;
-		iifname != @gated iifname != "lo" tcp dport 8181 drop
+		iifname != @gated iifname != "lo" tcp dport { 8181, 8180 } drop
+		iifname != @gated iifname != "lo" udp dport 8153 drop
 		iifname "wg1" meta nfproto ipv6 drop
 		iifname "wg1" ip saddr != @auth_wg1 jump unauth_input
 	}
@@ -219,13 +235,16 @@ table inet ns_wgauth {
 	}
 
 	chain unauth_input {
-		tcp dport 8181 accept
+		tcp dport { 8181, 8180 } accept
+		udp dport 8153 accept
 		icmp type echo-request accept
 		meta l4proto tcp reject with tcp reset
 		reject with icmpx type admin-prohibited
 	}
 }
 ```
+
+Without the redirect, the `prerouting` chain and the rules on ports 8180 and 8153 are left out.
 
 - The chains run just before fw4 (`priority filter - 1`). A drop or a reject here is final, while an accept only
   lets the packet go on to fw4: the zone rules still apply to logged-in users.
@@ -239,8 +258,19 @@ table inet ns_wgauth {
 - The login port is reachable only from gated WireGuard interfaces, never from LAN or WAN, whatever fw4 allows.
 - WireGuard server networks are IPv4 only: IPv6 coming from a gated interface is dropped.
 - Rejecting with a TCP reset makes browsers and apps fail at once instead of waiting.
-- Before the login there is no DNS, not even to the firewall: its resolver forwards queries to the internet, so a
-  copied configuration could tunnel data through it. The login page is opened by IP.
+- Before the login there is no real DNS, not even to the firewall: its resolver forwards queries to the internet, so
+  a copied configuration could tunnel data through it.
+- The redirect: before the login, the DNS queries of a peer go to the daemon (`dns_port`), which answers every name
+  with the address of the server (`dns_answer` in `nethsec.wgauth`, TTL 1 second, no record for AAAA and the other
+  types) and forwards nothing, so DNS still can't carry data out. The queries are limited to 100 per second per
+  server; the others are rejected. Web requests on port 80 go to an nginx server on `redirect_port`, which answers
+  `302 http://$server_addr:8181/`: after the redirect `$server_addr` is the address of the WireGuard server the request
+  came through. So any plain `http://` address, `http://neverssl.com` for example, opens the login page. `https://`
+  addresses still fail, as on a captive portal, and the redirect works only for peers whose DNS queries go through
+  the tunnel: all traffic routed, or the DNS of the server set to an address reached through it. At login the
+  daemon deletes the conntrack entries of the peer for UDP port 53 and TCP port 80, so its queries and requests reach
+  their real destination at once. Browsers that cache names regardless of the TTL, Firefox for example, may need a
+  minute for the names opened just before the login.
 - With no gated server the table is removed.
 
 ### Sessions
@@ -429,7 +459,8 @@ The `ns-wgauth` package (`PKGARCH:=all`), enabled by `config/ns-wgauth.conf`:
 - `/etc/init.d/ns-wgauth`: `START=15`, procd reload triggers, the daemon only while a server is gated
 - `/etc/config/ns-wgauth`
 - `/lib/upgrade/keep.d/ns-wgauth`: keeps `/etc/ns-wgauth/` and so the alerts across upgrades
-- `/www-wgauth/`: the login page, plain HTML, CSS and JavaScript without inline code
+- `/www-wgauth/`: the login page, plain HTML, CSS and JavaScript without inline code, its icon (SVG and PNG) and a
+  web app manifest for the home screen
 - `/etc/nginx/conf.d/ns-wgauth.conf`: generated by `sync`. A configuration that `nginx -t` refuses is reverted,
   because the same nginx serves the administration UI
 
@@ -492,7 +523,6 @@ downgrade warning.
 ## Future work
 
 - LDAP databases, reusing the bind logic of `openvpn-remote-auth`
-- redirect plain HTTP from peers that aren't logged in to the login page, like a captive portal
 - connection history, like the `connections.db` of OpenVPN Road Warrior
 - a companion app that opens the login page when the tunnel comes up
 

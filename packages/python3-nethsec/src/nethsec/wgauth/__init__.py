@@ -24,6 +24,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import struct
 import subprocess
 import syslog
 import threading
@@ -34,6 +35,14 @@ from nethsec import users, utils
 AUTH_MODES = ("key", "key_password", "key_password_otp")
 LOCK_MODES = ("strict", "roaming", "off")
 DEFAULT_PORT = 8181
+# before the login, web requests and DNS queries of a peer are redirected to these ports, see build_ruleset
+DEFAULT_REDIRECT_PORT = 8180
+DEFAULT_DNS_PORT = 8153
+DNS_TTL = 1
+# redirected DNS queries per second and per server, the others are rejected
+DNS_RATE = 100
+# bumped when the snapshot written by save_state changes: an older one is taken again
+STATE_VERSION = 2
 DEFAULT_TIMEOUT = 28800
 MIN_TIMEOUT = 300
 MAX_TIMEOUT = 604800
@@ -167,6 +176,11 @@ def _get_flag(uci, option, default):
         return default
 
 
+def _get_port(uci, option, default):
+    port = _get_count(uci, option, default)
+    return port if port <= 65535 else default
+
+
 def get_port(uci):
     """
     Return the TCP port of the login page.
@@ -177,8 +191,7 @@ def get_port(uci):
     Returns:
       - the `ns-wgauth.config.port` option, or the default port if it's missing or invalid
     """
-    port = _get_count(uci, "port", DEFAULT_PORT)
-    return port if port <= 65535 else DEFAULT_PORT
+    return _get_port(uci, "port", DEFAULT_PORT)
 
 
 def get_idle_timeout(uci):
@@ -382,7 +395,11 @@ def build_state(uci):
             "peers": peers,
         }
     return {
+        "version": STATE_VERSION,
         "port": get_port(uci),
+        "redirect": _get_flag(uci, "redirect", True),
+        "redirect_port": _get_port(uci, "redirect_port", DEFAULT_REDIRECT_PORT),
+        "dns_port": _get_port(uci, "dns_port", DEFAULT_DNS_PORT),
         "idle_timeout": get_idle_timeout(uci),
         "lock_endpoint": get_lock_endpoint(uci),
         "detect_copies": _get_flag(uci, "detect_copies", True),
@@ -426,10 +443,10 @@ def load_state():
     Read the configuration snapshot written by `save_state`.
 
     Returns:
-      - the snapshot, None if it's missing or unreadable
+      - the snapshot, None if it's missing, unreadable or written by another version
     """
     state = _read_json(STATE_FILE, None)
-    if not isinstance(state, dict) or not isinstance(state.get("servers"), dict):
+    if not isinstance(state, dict) or state.get("version") != STATE_VERSION:
         return None
     return state
 
@@ -637,22 +654,28 @@ def gate_status():
     return {"sessions": list_sessions(), "blocked": sorted(servers)}
 
 
-def build_ruleset(servers, port):
+def build_ruleset(servers, port, redirect=None):
     """
     Build the nftables script that creates or updates the table for the gated servers.
 
     The sets are added, not replaced: the open sessions survive. The chains are flushed and filled again.
     The chains run just before fw4: a drop or a reject is final, an accept lets fw4 apply its rules.
 
+    With `redirect`, the peers that aren't logged in find the login page from any plain http:// address: their web
+    requests go to a port where nginx answers with a redirect, their DNS queries to the daemon, that answers every
+    name with the address of the server, see `dns_answer`. Nothing is forwarded, so DNS still can't carry data out.
+
     Arguments:
       - servers -- the gated servers, see `list_gated_servers`
       - port -- the TCP port of the login page
+      - redirect -- None, or the `(http_port, dns_port)` the requests are redirected to
 
     Returns:
       - the script for `nft -f`
     """
     table = f"inet {TABLE}"
     devices = ", ".join(json.dumps(server) for server in servers)
+    tcp_ports = str(port) if redirect is None else f"{{ {port}, {redirect[0]} }}"
     lines = [
         f"add table {table}",
         f"add set {table} gated {{ type ifname; }}",
@@ -665,12 +688,18 @@ def build_ruleset(servers, port):
         f"add chain {table} input {{ type filter hook input priority filter - 1; policy accept; }}",
         f"add chain {table} forward {{ type filter hook forward priority filter - 1; policy accept; }}",
         f"add chain {table} unauth_input",
+        f"add chain {table} prerouting {{ type nat hook prerouting priority dstnat - 1; policy accept; }}",
         f"flush chain {table} input",
         f"flush chain {table} forward",
         f"flush chain {table} unauth_input",
-        # the login page is reachable only from the gated WireGuard interfaces
-        f'add rule {table} input iifname != @gated iifname != "lo" tcp dport {port} drop',
+        f"flush chain {table} prerouting",
     ]
+    if redirect is None:
+        lines.append(f"delete chain {table} prerouting")
+    # the login page is reachable only from the gated WireGuard interfaces
+    lines.append(f'add rule {table} input iifname != @gated iifname != "lo" tcp dport {tcp_ports} drop')
+    if redirect is not None:
+        lines.append(f'add rule {table} input iifname != @gated iifname != "lo" udp dport {redirect[1]} drop')
     for server in servers:
         device = json.dumps(server)
         unauth = f"iifname {device} ip saddr != @auth_{server}"
@@ -684,14 +713,37 @@ def build_ruleset(servers, port):
             f"add rule {table} forward oifname {device} meta nfproto ipv6 drop",
             f"add rule {table} forward oifname {device} ip daddr != @auth_{server} drop",
         ]
+        if redirect is not None:
+            dns = f"limit rate {DNS_RATE}/second redirect to :{redirect[1]}"
+            lines += [
+                f"add rule {table} prerouting {unauth} udp dport 53 {dns}",
+                f"add rule {table} prerouting {unauth} tcp dport 80 redirect to :{redirect[0]}",
+            ]
+    # before the login, only the login page and ping: DNS to the firewall resolver would let a copied configuration
+    # tunnel data
+    lines.append(f"add rule {table} unauth_input tcp dport {tcp_ports} accept")
+    if redirect is not None:
+        lines.append(f"add rule {table} unauth_input udp dport {redirect[1]} accept")
     lines += [
-        # before the login, only the login page and ping: DNS would let a copied configuration tunnel data
-        f"add rule {table} unauth_input tcp dport {port} accept",
         f"add rule {table} unauth_input icmp type echo-request accept",
         f"add rule {table} unauth_input meta l4proto tcp reject with tcp reset",
         f"add rule {table} unauth_input reject with icmpx type admin-prohibited",
     ]
     return "\n".join(lines) + "\n"
+
+
+def ruleset_for(state):
+    """
+    Build the nftables script for a configuration snapshot, see `build_ruleset`.
+
+    Arguments:
+      - state -- see `build_state`
+
+    Returns:
+      - the script for `nft -f`
+    """
+    redirect = (state["redirect_port"], state["dns_port"]) if state["redirect"] else None
+    return build_ruleset(sorted(state["servers"]), state["port"], redirect)
 
 
 def build_block_ruleset(servers):
@@ -727,7 +779,31 @@ def build_block_ruleset(servers):
     return "\n".join(lines) + "\n"
 
 
-def table_matches(objects, servers):
+def ruleset_shape(script):
+    """
+    Return the chains, and the number of rules in each, that a script built by `build_ruleset` leaves in the table.
+
+    Arguments:
+      - script -- see `build_ruleset`
+
+    Returns:
+      - a dictionary `{chain: rules}`
+    """
+    shape = {}
+    for line in script.splitlines():
+        words = line.split()
+        if len(words) < 5 or words[2:4] != ["inet", TABLE]:
+            continue
+        if words[:2] == ["add", "chain"]:
+            shape.setdefault(words[4], 0)
+        elif words[:2] == ["delete", "chain"]:
+            shape.pop(words[4], None)
+        elif words[:2] == ["add", "rule"]:
+            shape[words[4]] = shape.get(words[4], 0) + 1
+    return shape
+
+
+def table_matches(objects, servers, script):
     """
     Check that the table read from nftables has the chains and sets expected for the gated servers.
 
@@ -737,28 +813,34 @@ def table_matches(objects, servers):
     Arguments:
       - objects -- see `read_table`
       - servers -- the gated servers
+      - script -- the script that builds the table, see `build_ruleset`
 
     Returns:
       - True if the table looks complete
     """
     sets = {}
-    rules = {"input": 0, "forward": 0, "unauth_input": 0}
-    chains = set()
+    shape = {}
     for item in objects:
         if "set" in item:
             sets[item["set"].get("name")] = item["set"]
         elif "chain" in item:
-            chains.add(item["chain"].get("name"))
-        elif "rule" in item and item["rule"].get("chain") in rules:
-            rules[item["rule"]["chain"]] += 1
-    if chains != set(rules) or "gated" not in sets:
-        return False
-    if sorted(sets["gated"].get("elem", [])) != sorted(servers):
+            shape.setdefault(item["chain"].get("name"), 0)
+        elif "rule" in item:
+            chain = item["rule"].get("chain")
+            shape[chain] = shape.get(chain, 0) + 1
+    if "gated" not in sets or sorted(sets["gated"].get("elem", [])) != sorted(servers):
         return False
     if {name for name in sets if name.startswith("auth_")} != {f"auth_{server}" for server in servers}:
         return False
-    count = len(servers)
-    return rules == {"input": 1 + 2 * count, "forward": 5 * count, "unauth_input": 4}
+    return shape == ruleset_shape(script)
+
+
+def _gates(objects, servers):
+    # the table in place gates every server, with any port and with or without the redirect
+    return any(
+        table_matches(objects, servers, build_ruleset(servers, DEFAULT_PORT, redirect))
+        for redirect in (None, (DEFAULT_REDIRECT_PORT, DEFAULT_DNS_PORT))
+    )
 
 
 def _interface(server, action):
@@ -820,13 +902,14 @@ def apply_ruleset(state, force=True):
             _nft_script(f"delete table inet {TABLE}\n")
         _unblock(state)
         return servers
-    if not force and table_matches(objects, servers):
+    script = ruleset_for(state)
+    if not force and table_matches(objects, servers, script):
         return servers
     try:
-        _nft_script(build_ruleset(servers, state["port"]))
+        _nft_script(script)
     except RuntimeError as error:
         # the rules already in place, for example with the previous port, still gate every server
-        if not table_matches(objects, servers):
+        if not _gates(objects, servers):
             _block(servers, str(error))
         raise
     # a set can be deleted only after the rules using it, so outside the main script
@@ -897,6 +980,13 @@ def _flush_connections(address):
     _run(["conntrack", "-D", "-d", address])
 
 
+def _flush_redirected(address):
+    # conntrack keeps the redirect of a flow: after the login, the DNS queries and web requests of the peer must
+    # reach their real destination
+    _run(["conntrack", "-D", "-s", address, "-p", "udp", "--dport", "53"])
+    _run(["conntrack", "-D", "-s", address, "-p", "tcp", "--dport", "80"])
+
+
 def open_session(state, server, address, peer, endpoint=""):
     """
     Let a peer through after a successful login, or restart the timer of its session.
@@ -932,6 +1022,7 @@ def open_session(state, server, address, peer, endpoint=""):
             "endpoint": endpoint,
         }
         save_metadata(metadata)
+    _flush_redirected(address)
     log(f"login: user={peer['user']} server={server} peer={peer['peer']} address={address} from={endpoint}")
     return now + timeout
 
@@ -1018,6 +1109,50 @@ def read_endpoints():
         if len(fields) == 3 and fields[2] != "(none)":
             endpoints[fields[1]] = endpoint_address(fields[2])
     return endpoints
+
+
+def dns_answer(query, address, ttl=DNS_TTL):
+    """
+    Answer a DNS query redirected from a peer that isn't logged in: every name resolves to the server address, so
+    any plain http:// address leads to the login page. Nothing is forwarded.
+
+    Arguments:
+      - query -- the DNS message received
+      - address -- the IPv4 address of the server inside the VPN
+      - ttl -- seconds the answer can be cached: after the login the real names must work at once
+
+    Returns:
+      - the response, with an A record for A queries and no record for the other types, None if `query` isn't a
+        standard query with one question
+    """
+    if len(query) < 12:
+        return None
+    ident, flags, questions = struct.unpack("!HHH", query[:6])
+    # a response, or not a standard query
+    if flags & 0x8000 or (flags >> 11) & 0xF or questions != 1:
+        return None
+    offset = 12
+    while True:
+        if offset >= len(query):
+            return None
+        length = query[offset]
+        offset += 1
+        if length == 0:
+            break
+        # a question has no compressed names
+        if length & 0xC0:
+            return None
+        offset += length
+    if offset + 4 > len(query):
+        return None
+    qtype, qclass = struct.unpack("!HH", query[offset : offset + 4])
+    question = query[12 : offset + 4]
+    answers = b""
+    if qtype == 1 and qclass == 1:
+        answers = struct.pack("!HHHIH", 0xC00C, 1, 1, ttl, 4) + ipaddress.IPv4Address(address).packed
+    # response, authoritative, recursion desired copied from the query, recursion available
+    reply_flags = 0x8000 | 0x0400 | (flags & 0x0100) | 0x0080
+    return struct.pack("!HHHHHH", ident, reply_flags, 1, 1 if answers else 0, 0, 0) + question + answers
 
 
 def load_alerts():

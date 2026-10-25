@@ -1,5 +1,6 @@
 config main 'config'
 	option port '8181'
+	option redirect '1'
 	option idle_timeout '300'
 	option lock_endpoint '1'
 	option detect_copies '1'

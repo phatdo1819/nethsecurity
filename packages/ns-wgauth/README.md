@@ -26,6 +26,7 @@ The login service is configured in `/etc/config/ns-wgauth`:
 ```
 config main 'config'
 	option port '8181'
+	option redirect '1'
 	option idle_timeout '300'
 	option lock_endpoint '1'
 	option detect_copies '1'
@@ -35,6 +36,10 @@ config main 'config'
 ```
 
 - `port`: TCP port of the login page, reachable only from the WireGuard interfaces that require the login
+- `redirect`: `1` to lead any plain `http://` address to the login page before the login: the DNS queries of the
+  peer get a fake answer, the address of the server, and its web requests on port 80 a redirect to the login page.
+  Nothing is forwarded. It works when the DNS queries of the peers go through the tunnel. The local ports used are
+  `redirect_port` (8180) and `dns_port` (8153), optional
 - `idle_timeout`: seconds without a WireGuard handshake after which a session ends, `0` to disable the check
 - `lock_endpoint`: what happens when a peer sends from another public IP than at login
   - `1`: the session ends, so a copied configuration can't share the session of the real user. A user who changes
@@ -53,7 +58,9 @@ The changes take effect when they are applied (`uci commit ns-wgauth; reload_con
 UI): the daemon works on the configuration taken by `ns-wgauth sync`, not on the changes saved but not applied yet.
 
 The login page is `http://<server address>:<port>/`, for example `http://10.103.1.1:8181/`. The generated peer
-configurations contain it as a `# Login = ...` comment.
+configurations contain it as a `# Login = ...` comment. With `redirect`, any plain `http://` address opened before
+the login leads there too, `http://neverssl.com` for example. The page has an icon for the home screen of a phone,
+and its form is marked for password managers, so the browser can remember the username and password.
 
 ## How it works
 

@@ -1,5 +1,6 @@
 import json
 import os
+import struct
 import subprocess
 import time
 
@@ -151,7 +152,10 @@ class FakeCommands:
         return [cmd for cmd, _ in self.calls if cmd[0] == name]
 
 
-def table_objects(servers, sessions=None):
+REDIRECT = (wgauth.DEFAULT_REDIRECT_PORT, wgauth.DEFAULT_DNS_PORT)
+
+
+def table_objects(servers, sessions=None, redirect=REDIRECT):
     """Objects of `nft -j list table inet ns_wgauth` for a table built by `build_ruleset`."""
     sessions = sessions or {}
     objects = [{"metainfo": {"version": "1.1.1"}}, {"table": {"family": "inet", "name": "ns_wgauth"}}]
@@ -167,8 +171,7 @@ def table_objects(servers, sessions=None):
                 {"elem": {"val": address, "timeout": 3600, "expires": left}} for address, left in elements.items()
             ]
         objects.append({"set": nft_set})
-    counts = {"input": 1 + 2 * len(servers), "forward": 5 * len(servers), "unauth_input": 4}
-    for chain, count in counts.items():
+    for chain, count in wgauth.ruleset_shape(wgauth.build_ruleset(servers, 9443, redirect)).items():
         objects.append({"chain": {"family": "inet", "table": "ns_wgauth", "name": chain}})
         for _ in range(count):
             objects.append({"rule": {"family": "inet", "table": "ns_wgauth", "chain": chain, "expr": []}})
@@ -228,6 +231,8 @@ def test_default_settings(tmp_path):
     assert wgauth.get_idle_timeout(u) == wgauth.DEFAULT_IDLE_TIMEOUT
     assert wgauth.get_login_url(u, "wg1") == f"http://10.103.1.1:{wgauth.DEFAULT_PORT}/"
     state = wgauth.build_state(u)
+    assert state["redirect"] is True
+    assert (state["redirect_port"], state["dns_port"]) == REDIRECT
     assert state["lock_endpoint"] == "strict"
     assert state["detect_copies"] is True
     assert state["block_copies"] is False
@@ -288,6 +293,10 @@ def test_state_file(tmp_path, run_dir):
         assert os.stat(wgauth.STATE_FILE).st_mode & 0o777 == 0o600
     with open(wgauth.STATE_FILE, "w") as fp:
         fp.write("{broken")
+    assert wgauth.load_state() is None
+    # written by another version: taken again
+    with open(wgauth.STATE_FILE, "w") as fp:
+        json.dump(dict(state, version=1), fp)
     assert wgauth.load_state() is None
 
 
@@ -394,6 +403,60 @@ def test_build_ruleset():
     assert lines.index("add chain inet ns_wgauth unauth_input") < lines.index(
         'add rule inet ns_wgauth input iifname "wg1" ip saddr != @auth_wg1 jump unauth_input'
     )
+    # without redirect the nat chain is removed, if it was there
+    assert lines.index("flush chain inet ns_wgauth prerouting") < lines.index("delete chain inet ns_wgauth prerouting")
+    assert "prerouting" not in wgauth.ruleset_shape(script)
+
+
+def test_build_ruleset_redirect():
+    script = wgauth.build_ruleset(["wg1"], 8181, (8180, 8153))
+    lines = script.splitlines()
+    assert "delete chain inet ns_wgauth prerouting" not in lines
+    assert (
+        "add chain inet ns_wgauth prerouting { type nat hook prerouting priority dstnat - 1; policy accept; }" in lines
+    )
+    assert (
+        'add rule inet ns_wgauth prerouting iifname "wg1" ip saddr != @auth_wg1 udp dport 53 '
+        f"limit rate {wgauth.DNS_RATE}/second redirect to :8153"
+    ) in lines
+    unauth = 'iifname "wg1" ip saddr != @auth_wg1'
+    assert f"add rule inet ns_wgauth prerouting {unauth} tcp dport 80 redirect to :8180" in lines
+    # the redirect ports are reachable only from the gated interfaces, and before the login
+    assert 'add rule inet ns_wgauth input iifname != @gated iifname != "lo" tcp dport { 8181, 8180 } drop' in lines
+    assert 'add rule inet ns_wgauth input iifname != @gated iifname != "lo" udp dport 8153 drop' in lines
+    assert "add rule inet ns_wgauth unauth_input tcp dport { 8181, 8180 } accept" in lines
+    assert "add rule inet ns_wgauth unauth_input udp dport 8153 accept" in lines
+    # still nothing to the real DNS port of the firewall
+    assert not any("unauth_input" in line and "dport 53" in line for line in lines)
+    assert wgauth.ruleset_shape(script) == {"input": 4, "forward": 5, "unauth_input": 5, "prerouting": 2}
+
+
+def _dns_query(name, qtype=1, ident=0x1234, flags=0x0100):
+    labels = b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
+    return struct.pack("!HHHHHH", ident, flags, 1, 0, 0, 1) + labels + b"\x00" + struct.pack("!HH", qtype, 1)
+
+
+def test_dns_answer():
+    reply = wgauth.dns_answer(_dns_query("neverssl.com"), "10.103.1.1")
+    ident, flags, questions, answers, _, _ = struct.unpack("!HHHHHH", reply[:12])
+    assert (ident, questions, answers) == (0x1234, 1, 1)
+    # a response, recursion desired copied, no error
+    assert flags & 0x8000 and flags & 0x0100 and flags & 0x000F == 0
+    question_end = 12 + len(b"\x08neverssl\x03com\x00") + 4
+    assert reply[12:question_end] == _dns_query("neverssl.com")[12:]
+    name, rtype, rclass, ttl, length = struct.unpack("!HHHIH", reply[question_end : question_end + 12])
+    assert (name, rtype, rclass, ttl, length) == (0xC00C, 1, 1, wgauth.DNS_TTL, 4)
+    assert reply[question_end + 12 :] == bytes([10, 103, 1, 1])
+    # AAAA: no record, so the client uses IPv4
+    reply = wgauth.dns_answer(_dns_query("neverssl.com", qtype=28), "10.103.1.1")
+    assert struct.unpack("!HHHHHH", reply[:12])[3] == 0
+    # not a query to answer
+    assert wgauth.dns_answer(b"\x12\x34", "10.103.1.1") is None
+    assert wgauth.dns_answer(_dns_query("example.com", flags=0x8180), "10.103.1.1") is None
+    assert wgauth.dns_answer(_dns_query("example.com", flags=0x2800), "10.103.1.1") is None
+    assert wgauth.dns_answer(_dns_query("example.com")[:-3], "10.103.1.1") is None
+    compressed = struct.pack("!HHHHHH", 1, 0, 1, 0, 0, 0) + b"\xc0\x0c" + struct.pack("!HH", 1, 1)
+    assert wgauth.dns_answer(compressed, "10.103.1.1") is None
 
 
 def test_build_block_ruleset():
@@ -409,11 +472,16 @@ def test_build_block_ruleset():
 
 
 def test_table_matches():
-    assert wgauth.table_matches(table_objects(["wg1", "wg4"]), ["wg1", "wg4"])
-    assert not wgauth.table_matches(table_objects(["wg1"]), ["wg1", "wg4"])
-    assert not wgauth.table_matches([], ["wg1"])
-    broken = [item for item in table_objects(["wg1"]) if item.get("rule", {}).get("chain") != "forward"]
-    assert not wgauth.table_matches(broken, ["wg1"])
+    script = wgauth.build_ruleset(["wg1", "wg4"], 8181, REDIRECT)
+    assert wgauth.table_matches(table_objects(["wg1", "wg4"]), ["wg1", "wg4"], script)
+    assert not wgauth.table_matches(table_objects(["wg1"]), ["wg1", "wg4"], script)
+    assert not wgauth.table_matches([], ["wg1"], script)
+    broken = [item for item in table_objects(["wg1", "wg4"]) if item.get("rule", {}).get("chain") != "forward"]
+    assert not wgauth.table_matches(broken, ["wg1", "wg4"], script)
+    # the redirect turned off: the nat chain must go
+    without = wgauth.build_ruleset(["wg1", "wg4"], 8181)
+    assert not wgauth.table_matches(table_objects(["wg1", "wg4"]), ["wg1", "wg4"], without)
+    assert wgauth.table_matches(table_objects(["wg1", "wg4"], redirect=None), ["wg1", "wg4"], without)
 
 
 def test_parse_sessions():
@@ -443,7 +511,7 @@ def test_apply_ruleset(tmp_path, mocker, run_dir):
     fake = FakeCommands(table=None)
     mocker.patch("nethsec.wgauth._run", fake)
     assert wgauth.apply_ruleset(state) == ["wg1", "wg4", "wg5"]
-    assert fake.scripts() == [wgauth.build_ruleset(["wg1", "wg4", "wg5"], 9443)]
+    assert fake.scripts() == [wgauth.build_ruleset(["wg1", "wg4", "wg5"], 9443, REDIRECT)]
     # complete table, nothing to do unless forced
     fake = FakeCommands(table=table_objects(["wg1", "wg4", "wg5"]))
     mocker.patch("nethsec.wgauth._run", fake)
@@ -543,6 +611,9 @@ def test_open_and_close_session(tmp_path, mocker, run_dir):
         "delete element inet ns_wgauth auth_wg1 { 10.103.1.2 }",
         "add element inet ns_wgauth auth_wg1 { 10.103.1.2 timeout 3600s }",
     ]
+    # the DNS queries and web requests redirected before the login reach their destination now
+    assert ["conntrack", "-D", "-s", "10.103.1.2", "-p", "udp", "--dport", "53"] in fake.commands("conntrack")
+    assert ["conntrack", "-D", "-s", "10.103.1.2", "-p", "tcp", "--dport", "80"] in fake.commands("conntrack")
     entry = wgauth.load_metadata()["wg1"]["10.103.1.2"]
     assert entry["peer"] == ALICE
     assert entry["public_key"] == "KEY_ALICE"
