@@ -5,11 +5,12 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 
+import os
 import sys
 import json
 import subprocess
 from euci import EUci
-from nethsec import utils, firewall, ovpn, users, wgauth
+from nethsec import utils, firewall, ovpn, users, wgauth, wghistory
 import ipaddress
 import base64
 import configparser
@@ -1159,6 +1160,80 @@ def clear_peer_alerts(args):
     return {"result": "success"}
 
 
+HISTORY_DOWNLOADS = '/var/run/ns-api-server/downloads'
+
+
+def __history_args(args):
+    """The filters of the connection history, or a validation error."""
+    instances = args.get('instances', [])
+    if not isinstance(instances, list) or not all(isinstance(i, str) for i in instances):
+        return None, utils.validation_error('instances', 'invalid', instances)
+    accounts = args.get('accounts', [])
+    if not isinstance(accounts, list) or not all(isinstance(a, str) for a in accounts):
+        return None, utils.validation_error('accounts', 'invalid', accounts)
+    for name in ('start_time', 'page', 'per_page'):
+        value = args.get(name)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            return None, utils.validation_error(name, 'invalid', value)
+    return {
+        'instances': instances,
+        'q': str(args.get('q', '')),
+        'start_time': args.get('start_time') or 0,
+        'accounts': accounts,
+        'page': max(1, args.get('page') or 1),
+        'per_page': min(1000, max(1, args.get('per_page') or 10)),
+        'sort_by': str(args.get('sort_by', 'startTime')),
+        'desc': bool(args.get('desc', True)),
+    }, None
+
+
+def __server_names(e_uci):
+    return {i: e_uci.get('network', i, 'ns_name', default=i) for i in e_uci.get('network') if wgauth.is_server(e_uci, i)}
+
+
+def connection_history(args):
+    """A page of the connections of the peers of the servers, see nethsec.wghistory."""
+    filters, err = __history_args(args)
+    if err:
+        return err
+    e_uci = EUci()
+    try:
+        conn = wghistory.open_readonly(wghistory.db_path(e_uci))
+        try:
+            result = wghistory.query(conn, **filters)
+        finally:
+            if conn is not None:
+                conn.close()
+    except Exception:
+        return utils.generic_error('database_error')
+    # the names given by the administrator, for the servers that still exist
+    result['server_names'] = __server_names(e_uci)
+    return result
+
+
+def connection_history_csv(args):
+    """All the connection history in a CSV file of the downloads of ns-api-server, newest first."""
+    filters, err = __history_args(args)
+    if err:
+        return err
+    e_uci = EUci()
+    path = os.path.join(HISTORY_DOWNLOADS, 'wireguard_connection_history.csv')
+    try:
+        os.makedirs(HISTORY_DOWNLOADS, exist_ok=True)
+        if os.path.exists(path):
+            os.unlink(path)
+        conn = wghistory.open_readonly(wghistory.db_path(e_uci))
+        try:
+            wghistory.export_csv(conn, path, str(args.get('timezone', 'UTC')), __server_names(e_uci), filters['instances'])
+        finally:
+            if conn is not None:
+                conn.close()
+        os.chmod(path, 0o400)
+    except Exception:
+        return utils.generic_error('database_error')
+    return {"csv_path": path}
+
+
 cmd = sys.argv[1]
 
 if cmd == 'list':
@@ -1254,7 +1329,18 @@ if cmd == 'list':
             "udp_port": 51820,
             "dns": ["1.1.1.1"]
         },
-        "delete-tunnel": {"id": "tunnelid"}
+        "delete-tunnel": {"id": "tunnelid"},
+        "connection-history": {
+            "instances": ["wg1"],
+            "q": "alice",
+            "start_time": 1735689600,
+            "accounts": ["Alice laptop"],
+            "page": 1,
+            "per_page": 10,
+            "sort_by": "startTime",
+            "desc": True
+        },
+        "connection-history-csv": {"instances": ["wg1"], "timezone": "Europe/Rome"}
     }))
 else:
     action = sys.argv[2]
@@ -1310,5 +1396,11 @@ else:
     elif action == 'delete-tunnel':
         args = json.loads(sys.stdin.read())
         ret = delete_tunnel(args)
+    elif action == 'connection-history':
+        args = json.loads(sys.stdin.read())
+        ret = connection_history(args)
+    elif action == 'connection-history-csv':
+        args = json.loads(sys.stdin.read())
+        ret = connection_history_csv(args)
 
     print(json.dumps(ret))

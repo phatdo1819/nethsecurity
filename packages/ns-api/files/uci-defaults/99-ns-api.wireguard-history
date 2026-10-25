@@ -1,0 +1,13 @@
+#!/bin/sh
+
+#
+# Copyright (C) 2026 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-2.0-only
+#
+
+# The connection history of the WireGuard servers, every minute: see nethsec.wghistory
+
+mkdir -p /etc/crontabs
+if ! grep -qs '/usr/libexec/wireguard-history' /etc/crontabs/root; then
+  echo '* * * * * /usr/libexec/wireguard-history' >> /etc/crontabs/root
+fi

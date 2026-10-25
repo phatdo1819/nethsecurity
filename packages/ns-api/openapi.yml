@@ -1150,3 +1150,162 @@ paths:
                   - $ref: "#/components/schemas/WireGuardResult"
                   - $ref: "#/components/schemas/ValidationError"
                   - $ref: "#/components/schemas/Error"
+  POST /ubus/ns.wireguard/connection-history:
+    post:
+      summary: Read a page of the connection history of the peers of the servers
+      description: >-
+        Recorded every minute from the handshakes and the counters of WireGuard, see nethsec.wghistory. Empty
+        without a history yet.
+      operationId: ns.wireguard.connection-history
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                instances:
+                  type: array
+                  description: The servers to include, all if empty
+                  items:
+                    type: string
+                  example: ["wg1"]
+                q:
+                  type: string
+                  description: Text in the name of the peer, its user, its addresses or its server
+                start_time:
+                  type: integer
+                  description: Only the connections started from this time, seconds since 1970
+                accounts:
+                  type: array
+                  description: The names of the peers to include, all if empty
+                  items:
+                    type: string
+                page:
+                  type: integer
+                  minimum: 1
+                  default: 1
+                per_page:
+                  type: integer
+                  minimum: 1
+                  maximum: 1000
+                  default: 10
+                sort_by:
+                  type: string
+                  enum: [startTime, endTime, duration, account, user, instance, virtualIpAddress, remoteIpAddress,
+                         bytesReceived, bytesSent]
+                  default: startTime
+                desc:
+                  type: boolean
+                  default: true
+      responses:
+        "200":
+          description: A page of the history
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      connections:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            instance:
+                              type: string
+                              example: wg1
+                            peer:
+                              type: string
+                            account:
+                              type: string
+                              description: The name of the peer at the time of the connection
+                            user:
+                              type: string
+                              description: The linked user, empty if none
+                            virtualIpAddress:
+                              type: string
+                            remoteIpAddress:
+                              type: string
+                            startTime:
+                              type: integer
+                            endTime:
+                              type: [integer, "null"]
+                              description: Null while connected
+                            duration:
+                              type: integer
+                            connected:
+                              type: boolean
+                            bytesReceived:
+                              type: integer
+                              description: From the peer
+                            bytesSent:
+                              type: integer
+                              description: To the peer
+                      current_page:
+                        type: integer
+                      last_page:
+                        type: integer
+                      per_page:
+                        type: integer
+                      total:
+                        type: integer
+                        description: All the rows of the history
+                      results:
+                        type: integer
+                        description: The rows that match the filters
+                      filters:
+                        type: object
+                        properties:
+                          accounts:
+                            type: array
+                            items:
+                              type: string
+                          instances:
+                            type: array
+                            items:
+                              type: string
+                      server_names:
+                        type: object
+                        additionalProperties:
+                          type: string
+                        example: {"wg1": "HQ"}
+                  - $ref: "#/components/schemas/ValidationError"
+                  - $ref: "#/components/schemas/Error"
+  POST /ubus/ns.wireguard/connection-history-csv:
+    post:
+      summary: Write all the connection history in a CSV file of the downloads
+      operationId: ns.wireguard.connection-history-csv
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                instances:
+                  type: array
+                  items:
+                    type: string
+                timezone:
+                  type: string
+                  description: The time zone of the times, UTC if missing or unknown
+                  example: Europe/Rome
+      responses:
+        "200":
+          description: The path of the CSV file
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      csv_path:
+                        type: string
+                        example: /var/run/ns-api-server/downloads/wireguard_connection_history.csv
+                  - $ref: "#/components/schemas/ValidationError"
+                  - $ref: "#/components/schemas/Error"
