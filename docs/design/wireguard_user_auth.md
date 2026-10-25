@@ -54,8 +54,9 @@ Not covered:
    if required, the OTP code. Until then only the login page answers: everything else is rejected.
 4. After the login the traffic flows. The page shows when the session expires and has a log-out button.
 5. The session ends when it expires (8 hours by default), when the peer doesn't handshake for 5 minutes,
-   when the peer shows up from another public IP, when the user logs out, or when the administrator changes the
-   peer, the user or the server. The user then logs in again.
+   when the peer shows up from another public IP, when the configuration seems used by two devices, when the user
+   logs out, or when the administrator applies a change to the peer, the user or the server. The user then logs in
+   again.
 
 ## Clients
 
@@ -121,9 +122,16 @@ config main 'config'
 	option port '8181'
 	option idle_timeout '300'
 	option lock_endpoint '1'
+	option detect_copies '1'
+	option block_copies '0'
 	option max_failures '5'
 	option lockout_time '900'
 ```
+
+- `lock_endpoint`: `1` (strict), `roaming` or `0`, see [Copied configurations](#copied-configurations)
+- `detect_copies`: watch the endpoints for a configuration used by two devices at once
+- `block_copies`: block such a peer until an administrator acts, instead of only ending its session
+- `max_failures`, `lockout_time`: failed logins from one public IP before it's locked out, and for how long
 
 ## Architecture
 
@@ -149,9 +157,25 @@ Components:
 - an nginx server block on the login port (`/etc/nginx/conf.d/ns-wgauth.conf`): it serves the static page from
   `/www-wgauth` and proxies `/api/` to the daemon, adding request size limits and rate limiting (`limit_req`)
 - the `ns-wgauth` daemon (`ns-wgauth serve`, Python, on `/var/run/ns-wgauth.sock`): it checks credentials, adds
-  and removes set elements, and every 15 seconds ends the sessions that are no longer valid
-- `ns-wgauth sync`: it builds the table and the nginx server from UCI, keeping the sessions that are still valid
+  and removes set elements, every 5 seconds watches the endpoints for copied configurations and every 15 seconds
+  ends the sessions that are no longer valid
+- `ns-wgauth sync`: it applies the configuration: it takes the snapshot the daemon works on, builds the table and
+  the nginx server, and ends the sessions that are no longer valid
+- `ns-wgauth check`: it tests on the firewall what can't be tested elsewhere, see [Failing closed](#failing-closed)
 - `nethsec.wgauth` in python3-nethsec: the logic shared by the daemon and the `ns.wireguard` API
+
+### Applied configuration
+
+UCI keeps the changes saved but not applied yet in `/tmp/.uci`, and every reader sees them, the daemon too.
+Without care, a server switched to `key` in the UI would lose its gate within 15 seconds, before the administrator
+applies the change or even if they discard it; a new password would log the user out before it's applied.
+
+So the daemon never reads UCI. `ns-wgauth sync`, run by the init script at boot and on every configuration reload,
+writes a snapshot of what the login needs to `/var/run/ns-wgauth/state.json` (readable by root only, it holds the
+password hashes and the OTP secrets of the linked users): the gated servers, their enabled peers by reserved IP with
+public key, user, password hash, OTP secret and credentials fingerprint, and the `ns-wgauth` settings. The login
+checks, the periodic checks and the gate all use this snapshot, so a change takes effect when it's applied, through
+the procd reload triggers, and not before.
 
 ### Why a separate nftables table
 
@@ -223,22 +247,26 @@ table inet ns_wgauth {
 
 - Login: the daemon adds the peer's address to the server's set with the `ns_auth_timeout` timeout.
   A new login replaces the element and restarts the timer.
-- What the firewall knows about each session is in `/var/run/ns-wgauth/sessions.json`: peer, user, login time,
-  public IP of the client at login, latest handshake seen and a fingerprint of the credentials (authentication mode, database, user name, password
-  hash and, with OTP, the secret). A file lock serializes the daemon and the `sync` command.
+- What the firewall knows about each session is in `/var/run/ns-wgauth/sessions.json`: peer, public key, user,
+  login time, public IP of the client, latest handshake seen and a fingerprint of the credentials (authentication
+  mode, database, user name, password hash and, with OTP, the secret). A file lock serializes the daemon and the
+  `sync` command.
 - Expiry: nftables removes the element when the timeout ends; the next check forgets its metadata.
-- Every 15 seconds, and on every `sync`, the sessions are checked. A session ends when:
+- Every 15 seconds, and on every `sync`, the sessions are checked against the
+  [applied configuration](#applied-configuration). A session ends when:
   - its metadata is missing
   - the server is disabled or doesn't require the login anymore
-  - the peer is disabled, removed, linked to another user, or has another reserved IP
+  - the peer is disabled, removed, linked to another user, has another reserved IP or new keys
   - the user is removed, or its fingerprint changed (for example a new password)
+  - the peer is blocked, see [Copied configurations](#copied-configurations)
   - the peer's latest handshake is older than `idle_timeout` (`wg show all latest-handshakes`). The generated
     configurations set `PersistentKeepalive = 25`, so a connected client renews its handshake about every
     2 minutes even when idle. The check remembers the latest handshake it has seen: a commit that touches a
     server restarts its interface (`restart-wireguard.py`) and resets the handshakes, and that must not end the
     sessions of its peers
-  - with `lock_endpoint` (the default), the peer sends from another public IP than at login
-    (`wg show all endpoints`, the port is ignored), see [Copied configurations](#copied-configurations)
+  - with `lock_endpoint` set to `1` (the default), the peer sends from another public IP than at login
+    (`wg show all endpoints`, the port is ignored). With `roaming` the session follows the peer to its new IP.
+    See [Copied configurations](#copied-configurations)
 - Logout: from the login page, or by the administrator with `ns.wireguard logout-peer` or `ns-wgauth logout`.
 - Sessions live only in kernel memory and in `/var/run`: a reboot or an HA failover logs everyone out.
 
@@ -247,8 +275,9 @@ table inet ns_wgauth {
 nginx serves it at `http://<server address>:<port>/api/` and proxies it to the daemon, adding `X-Real-IP` (the
 client address) and `X-Forwarded-Host` (the requested host).
 
-- `GET /api/status`: `{"authenticated": false, "otp_required": true, "server": "Road warriors"}`; with a session
-  also `"user"` and `"expires"`
+- `GET /api/status`: `{"authenticated": false, "otp_required": true, "server": "Road warriors", "blocked": false,
+  "no_user": false}`; with a session also `"user"` and `"expires"`. `blocked` and `no_user` let the page explain why
+  the user can't log in
 - `POST /api/login` with `{"username": "alice", "password": "...", "otp": "123456"}`:
   `{"result": "success", "user": "alice", "expires": "2026-10-24T18:00:00+00:00"}`
 - `POST /api/logout` with `{}`: `{"result": "success"}`
@@ -260,11 +289,17 @@ site can't send it without a CORS preflight, which the API never answers.
 
 The login checks:
 
-1. the peer isn't locked out: after `max_failures` failures it gets `429 {"error": "too_many_attempts"}` for
-   `lockout_time` seconds; nginx also limits the login requests per address
-2. the username matches the peer's `ns_user`, case insensitive like `users.get_user_by_name()`
-3. the user exists in `ns_user_db` and `users.check_password()` accepts the password
-4. with `key_password_otp`, the TOTP code is valid (`pyotp`, accepting the previous and next 30 seconds) and wasn't
+1. the peer isn't blocked (`403 {"error": "blocked"}`) and has a user (`403 {"error": "no_user"}`)
+2. the public IP of the client isn't locked out: after `max_failures` failures from that IP it gets
+   `429 {"error": "too_many_attempts"}` for `lockout_time` seconds. The failures are counted per public IP
+   (`wg show all endpoints`), not per peer: someone trying passwords with a copied configuration from another network
+   doesn't lock out the real user. So that many IPs don't multiply the attempts, a peer failing `4 × max_failures`
+   times in `lockout_time` from any IP is locked out everywhere but at the IP of its latest successful login.
+   A lockout is recorded as an alert of the peer. nginx also limits the login requests of a VPN address
+   (30 per minute): every copy of a configuration shares that address, so the limit only stops floods
+3. the username matches the peer's `ns_user`, case insensitive like `users.get_user_by_name()`
+4. the user exists in `ns_user_db` and `users.check_password()` accepts the password
+5. with `key_password_otp`, the TOTP code is valid (`pyotp`, accepting the previous and next 30 seconds) and wasn't
    already used by this user in the last 2 minutes
 
 Every failed check returns the same `401 {"error": "invalid_credentials"}`, so the page doesn't tell which one
@@ -287,8 +322,17 @@ To avoid it:
 - the table keeps gating disabled servers too: enabling a server never opens a window without the gate
 - every 15 seconds the daemon checks the table and rebuilds it if it's missing or incomplete, for example after
   `fw4 flush`; the sessions are then lost and users log in again
+- if nftables refuses the login rules, and the table in place doesn't already gate every server, `sync` loads
+  fallback rules instead: `iifname "wg1" drop` and `oifname "wg1" drop` in the input and forward chains, with a
+  numeric priority and nothing else, so they don't depend on the syntax of the login rules. Nobody can log in, but
+  nobody gets through with the key alone. If even those are refused, the daemon takes the server interfaces down
+  (`ubus call network.interface down`). Both states are recorded in `/var/run/ns-wgauth/blocked.json`, logged once,
+  and undone as soon as the login rules load, for example after a fix
 - `ns.wireguard list-servers` reports `auth_enforced: false` when a server requires the login but its set is
-  missing, so the UI can warn the administrator
+  missing, and `auth_blocked: true` when the fallback rules block it, so the UI can warn the administrator
+- `ns-wgauth check` asks nftables to validate both rule sets without applying them (`nft -c`), runs `nginx -t`,
+  checks the table, the nginx server and the daemon, and warns about peers without a user and about peers sharing a
+  public IP (a router hiding the client IPs, see [Behind NAT](#behind-nat))
 
 The init script registers procd reload triggers on the `network`, `users` and `ns-wgauth` configurations:
 any commit that adds a server, changes a peer or a password runs `sync` again. Starting the daemon is also decided
@@ -300,15 +344,30 @@ The goal is that a leaked or copied peer configuration alone doesn't give access
 
 - **The configuration alone**: the copy completes the WireGuard handshake, because the key is valid, but reaches
   only the login page and ping. Without the username, the password and, with `key_password_otp`, the OTP code of the
-  linked user, it gets nothing else. Wrong attempts lock the peer out (`max_failures`, `lockout_time`), nginx limits
-  the login requests, and every failure is logged. The page doesn't tell the username.
+  linked user, it gets nothing else. Wrong attempts lock out the public IP they come from (`max_failures`,
+  `lockout_time`), not the peer, so the real user can still log in from another network; every failure is logged and
+  a lockout becomes an alert of the peer. The page doesn't tell the username.
 - **The configuration used while the user is logged in**: WireGuard can't tell apart two devices with the same key,
-  and the session belongs to the key. With `lock_endpoint`, the session is bound to the public IP the client had at
-  login: when the copy sends from another network the session ends within 15 seconds and a
-  `possible copy of the configuration` warning is logged. The legitimate user must log in again; while both devices
-  are active, neither keeps a session.
-- **Limits of the lock**: two devices behind the same public IP (the same office or home network) can't be told
-  apart. A user who changes network, for example from Wi-Fi to 4G, logs in again.
+  and the session belongs to the key. With `lock_endpoint` set to `1`, the session is bound to the public IP the
+  client had at login: when the copy sends from another network the session ends within 15 seconds. The legitimate
+  user must log in again; while both devices are active, neither keeps a session.
+- **Two devices at once**: WireGuard sends to the public IP of the latest packet received, so while two devices with
+  the same key are active the endpoint of the peer keeps switching between their IPs. Every 5 seconds the daemon
+  reads the endpoints of the gated peers (`CopyDetector` in `nethsec.wgauth`): three changes within 5 minutes that go
+  back to an IP already seen mean two devices, whereas a device that changes network moves once, or always to new
+  IPs. Then, whether the user is logged in or not, the session of the peer ends, a `possible copy of the
+  configuration` warning is logged and an alert is recorded, at most once an hour while both devices stay active.
+  With `block_copies` the peer is also blocked: the login page refuses it until an administrator clears its alerts or
+  generates new keys.
+- **Alerts**: they are kept in `/etc/ns-wgauth/alerts.json`, across reboots and upgrades (`/lib/upgrade/keep.d`),
+  at most 20 per peer and for 30 days. They belong to the keys of the peer: once new keys are applied, the old alerts
+  and the block are dropped. `ns.wireguard list-servers` returns them per peer, and the UI shows them.
+- **The response to a leak**: generate new keys for the peer (`ns.wireguard regenerate-peer-keys`), apply, and give
+  the new configuration to the user. Every copy of the old one stops working, even with the password.
+- **Limits**: two devices behind the same public IP (the same office or home network) can't be told apart. With
+  `lock_endpoint` set to `1`, a user who changes network, for example from Wi-Fi to 4G, logs in again; with
+  `roaming` the session follows them, and a copy used while the real device is off or asleep, so without switching,
+  keeps the session until it expires.
 - **Configuration, password and OTP secret leaked together** defeat the login: deliver them through different
   channels, and enroll the OTP in person or over a screen share.
 
@@ -323,9 +382,10 @@ The firewall keeps the private keys of the peers, in its configuration and in it
 The firewall can sit behind a router that forwards the WireGuard UDP port to it, with a single network card:
 
 - only the WireGuard port is forwarded: the login page is reached through the tunnel
-- the endpoints seen by the firewall must be the public IPs of the clients (check with `wg show wg1 endpoints`).
-  A port forward keeps them; if the router also masquerades the forwarded traffic, every client shows the router
-  address, and `lock_endpoint` must be disabled because it can't tell clients apart
+- the endpoints seen by the firewall must be the public IPs of the clients (check with `wg show wg1 endpoints`, or
+  `ns-wgauth check`, which warns when peers share an IP). A port forward keeps them; if the router also masquerades
+  the forwarded traffic, every client shows the router address, `lock_endpoint` must be disabled because it can't
+  tell clients apart, and the copy detection can't work either
 - the traffic from the LAN back to the VPN clients needs a route on the router or masquerading on the firewall,
   as for any VPN on such a firewall
 
@@ -339,12 +399,17 @@ The firewall can sit behind a router that forwards the WireGuard UDP port to it,
   a client that doesn't know them, like an older UI, can't turn the login off.
 - `add-peer`, `edit-peer`: new parameter `user`, required on gated servers; on edit, a missing `user` keeps the
   current one. Validation errors: `user` `required`, `user_not_found`; `remote_networks` `not_allowed`.
-- `list-servers`: servers also return `auth_mode`, `user_db`, `auth_timeout`, `login_url` and `auth_enforced`;
-  peers also return `user`, `authenticated` and `auth_expires`.
+- `list-servers`: servers also return `auth_mode`, `user_db`, `auth_timeout`, `login_url`, `auth_enforced` and
+  `auth_blocked`; peers also return `user`, `authenticated`, `auth_expires`, `blocked` and `alerts` (newest first,
+  `{"time": "...", "type": "copy" | "lockout", "addresses": ["198.51.100.20"]}`).
 - new `logout-peer` (`{"id": "wg1_ns_1234abcd_peer"}`): ends the peer's session. It changes no UCI option,
   so there is nothing to commit.
 - new `download-peer-2fa` (`{"id": "wg1_ns_1234abcd_peer"}`): returns the OTP QR code of the linked user as SVG,
   like `ns.ovpnrw download-user-2fa`.
+- new `regenerate-peer-keys` (`{"id": "wg1_ns_1234abcd_peer"}`): new private and public keys for a server peer, and
+  a new pre-shared key if it has one. The change is saved, to be applied with `ns.commit`.
+- new `clear-peer-alerts` (`{"id": "wg1_ns_1234abcd_peer"}`): forgets the alerts of the peer and unblocks it. Like
+  `logout-peer`, it changes no UCI option.
 - the peer configuration gets the `# Login = ...` comment on gated servers.
 
 The ACL `ns.wireguard.json` already allows every method of `ns.wireguard`.
@@ -359,9 +424,11 @@ linked to another user.
 
 The `ns-wgauth` package (`PKGARCH:=all`), enabled by `config/ns-wgauth.conf`:
 
-- `/usr/sbin/ns-wgauth`: the daemon and the `sync`, `needed`, `status` and `logout` commands
+- `/usr/sbin/ns-wgauth`: the daemon and the `sync`, `check`, `needed`, `status`, `logout`, `alerts` and `clear`
+  commands
 - `/etc/init.d/ns-wgauth`: `START=15`, procd reload triggers, the daemon only while a server is gated
 - `/etc/config/ns-wgauth`
+- `/lib/upgrade/keep.d/ns-wgauth`: keeps `/etc/ns-wgauth/` and so the alerts across upgrades
 - `/www-wgauth/`: the login page, plain HTML, CSS and JavaScript without inline code
 - `/etc/nginx/conf.d/ns-wgauth.conf`: generated by `sync`. A configuration that `nginx -t` refuses is reverted,
   because the same nginx serves the administration UI
@@ -380,6 +447,7 @@ after a failover users log in again.
 ## Upgrades and downgrades
 
 - Existing servers have no `ns_auth_mode`, so they behave as `key` and nothing changes.
+- The alerts, and so the blocked peers, survive an upgrade; the sessions don't.
 - Servers created with the WireGuard API before the UI rewrite may still have `ns_user_db`:
   `wireguard-migrate.py` doesn't remove it. The gate depends on `ns_auth_mode`, not on `ns_user_db`,
   so those servers aren't affected.
@@ -400,8 +468,10 @@ In nethsecurity-ui:
 
 - server form: authentication mode, users database, session length
 - peer form: user picker, required on gated servers; no remote networks on gated servers
-- peer list: user, logged-in state, session expiry, log-out action, OTP QR code download
-- server card: login page address, warning when `auth_enforced` is `false`
+- peer list: user ("No user" warning when missing), logged-in state, session expiry, blocked state and alerts,
+  log-out, OTP QR code download, clear warnings and generate new keys actions
+- server form: warning that the peers without a user can't log in once the login is required
+- server card: login page address, warning when `auth_enforced` is `false`, error when `auth_blocked` is `true`
 
 The administrator manual in nethsecurity-docs gets a section about the login, the steps for the users and the
 downgrade warning.

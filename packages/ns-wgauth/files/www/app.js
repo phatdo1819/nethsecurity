@@ -6,7 +6,12 @@
 'use strict'
 
 const REFRESH_MS = 30000
-const sections = ['loading', 'unavailable', 'login', 'session']
+const sections = ['loading', 'unavailable', 'refused', 'login', 'session']
+const REFUSED = {
+  blocked:
+    'This VPN configuration is blocked: it seems to be used on more than one device at the same time. Contact your administrator.',
+  no_user: 'This VPN configuration is not linked to a user yet. Contact your administrator.'
+}
 const element = (id) => document.getElementById(id)
 let refreshTimer
 
@@ -40,6 +45,11 @@ function describeExpiry(iso) {
   return `at ${expires.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} (in ${left})`
 }
 
+function showRefused(reason) {
+  element('refused-message').textContent = REFUSED[reason]
+  show('refused')
+}
+
 function showError(message) {
   const error = element('login-error')
   error.textContent = message
@@ -65,6 +75,8 @@ async function refresh() {
     element('user').textContent = status.user
     element('expires').textContent = describeExpiry(status.expires)
     show('session')
+  } else if (status.blocked || status.no_user) {
+    showRefused(status.blocked ? 'blocked' : 'no_user')
   } else {
     element('otp-field').hidden = !status.otp_required
     element('otp').required = Boolean(status.otp_required)
@@ -102,6 +114,8 @@ async function login(event) {
       showError(`Too many failed attempts. Try again in ${minutes} min.`)
     } else if (result.status === 401) {
       showError('Wrong username, password or OTP code.')
+    } else if (result.status === 403 && REFUSED[result.data.error]) {
+      showRefused(result.data.error)
     } else {
       showError('The login failed. Try again later or contact your administrator.')
     }

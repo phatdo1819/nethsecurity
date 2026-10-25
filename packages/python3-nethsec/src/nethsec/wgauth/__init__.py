@@ -13,6 +13,9 @@ the firewall until the user logs in with the credentials of the server's `ns_use
 logged-in peers are kept in the `inet ns_wgauth` nftables table, one set per server, and the `ns-wgauth` daemon
 adds and removes them.
 
+The daemon works on a snapshot of the configuration, see `build_state`, taken when the configuration is applied:
+changes saved but not applied yet don't reach it.
+
 See docs/design/wireguard_user_auth.md.
 """
 
@@ -29,15 +32,31 @@ import time
 from nethsec import users, utils
 
 AUTH_MODES = ("key", "key_password", "key_password_otp")
+LOCK_MODES = ("strict", "roaming", "off")
 DEFAULT_PORT = 8181
 DEFAULT_TIMEOUT = 28800
 MIN_TIMEOUT = 300
 MAX_TIMEOUT = 604800
 DEFAULT_IDLE_TIMEOUT = 300
+DEFAULT_MAX_FAILURES = 5
+DEFAULT_LOCKOUT_TIME = 900
+# a peer failing this many times max_failures, from any IP, is locked out everywhere but at its latest login IP
+PEER_FAILURE_FACTOR = 4
+# seconds and endpoint changes that tell two devices sharing a key from a device changing network
+COPY_WINDOW = 300
+COPY_CHANGES = 3
+# while both devices stay active the copy is seen again and again: one alert per hour is enough
+COPY_REPORT_INTERVAL = 3600
+MAX_ALERTS = 20
+ALERT_AGE = 30 * 86400
 TABLE = "ns_wgauth"
 RUN_DIR = "/var/run/ns-wgauth"
 SESSIONS_FILE = os.path.join(RUN_DIR, "sessions.json")
+STATE_FILE = os.path.join(RUN_DIR, "state.json")
+BLOCKED_FILE = os.path.join(RUN_DIR, "blocked.json")
 LOCK_FILE = os.path.join(RUN_DIR, "lock")
+# kept across reboots and upgrades: a blocked peer must stay blocked
+ALERTS_FILE = "/etc/ns-wgauth/alerts.json"
 
 _lock = threading.RLock()
 _lock_depth = 0
@@ -133,6 +152,21 @@ def list_gated_servers(uci):
     return sorted(section for section in uci.get("network") if is_gated(uci, section))
 
 
+def _get_count(uci, option, default, minimum=1):
+    try:
+        value = int(uci.get("ns-wgauth", "config", option, default=default))
+    except (TypeError, ValueError):
+        return default
+    return max(value, minimum)
+
+
+def _get_flag(uci, option, default):
+    try:
+        return uci.get("ns-wgauth", "config", option, dtype=bool, default=default)
+    except ValueError:
+        return default
+
+
 def get_port(uci):
     """
     Return the TCP port of the login page.
@@ -143,11 +177,8 @@ def get_port(uci):
     Returns:
       - the `ns-wgauth.config.port` option, or the default port if it's missing or invalid
     """
-    try:
-        port = int(uci.get("ns-wgauth", "config", "port", default=DEFAULT_PORT))
-    except (TypeError, ValueError):
-        return DEFAULT_PORT
-    return port if 1 <= port <= 65535 else DEFAULT_PORT
+    port = _get_count(uci, "port", DEFAULT_PORT)
+    return port if port <= 65535 else DEFAULT_PORT
 
 
 def get_idle_timeout(uci):
@@ -160,31 +191,34 @@ def get_idle_timeout(uci):
     Returns:
       - the `ns-wgauth.config.idle_timeout` option, or the default if it's missing or invalid
     """
-    try:
-        timeout = int(uci.get("ns-wgauth", "config", "idle_timeout", default=DEFAULT_IDLE_TIMEOUT))
-    except (TypeError, ValueError):
-        return DEFAULT_IDLE_TIMEOUT
-    return max(timeout, 0)
+    return _get_count(uci, "idle_timeout", DEFAULT_IDLE_TIMEOUT, minimum=0)
 
 
 def get_lock_endpoint(uci):
     """
-    Check if a session ends when its peer shows up from another public IP.
+    Return what happens to a session when its peer shows up from another public IP.
 
     WireGuard can't tell apart two devices with the same key: a copy of the configuration used while the user is
     logged in would share the session. The public IP the peer had at login tells them apart, unless both are behind
-    the same NAT. The price: a user who changes network (for example from Wi-Fi to 4G) must log in again.
+    the same NAT.
+
+    - `strict` (option `1`): the session ends, the user logs in again, for example after moving from Wi-Fi to 4G
+    - `roaming`: the session follows the peer to its new IP. Two devices sharing the key are still caught, see
+      `CopyDetector`, but a copy used while the real device is off or asleep keeps the session
+    - `off` (option `0`): the IP is ignored, for a router that hides the IPs of the clients
 
     Arguments:
       - uci -- EUci pointer
 
     Returns:
-      - the `ns-wgauth.config.lock_endpoint` option, True if it's missing or invalid
+      - one of `LOCK_MODES`, `strict` if the option is missing or invalid
     """
-    try:
-        return uci.get("ns-wgauth", "config", "lock_endpoint", dtype=bool, default=True)
-    except ValueError:
-        return True
+    value = str(uci.get("ns-wgauth", "config", "lock_endpoint", default="1")).lower()
+    if value == "roaming":
+        return "roaming"
+    if value in ("0", "off", "no", "false", "disabled"):
+        return "off"
+    return "strict"
 
 
 def get_session_timeout(uci, server):
@@ -253,29 +287,6 @@ def list_peers(uci, server):
     return utils.get_all_by_type(uci, "network", f"wireguard_{server}") or {}
 
 
-def find_peer(uci, address):
-    """
-    Find the peer that can log in from an address.
-
-    Arguments:
-      - uci -- EUci pointer
-      - address -- IPv4 address of the client inside the VPN
-
-    Returns:
-      - a `(server, peer)` tuple for the enabled peer of an enabled gated server whose reserved IP is
-        `address`, `(None, None)` if there is no such peer
-    """
-    for server in list_gated_servers(uci):
-        if not is_enabled(uci, server):
-            continue
-        for peer, options in list_peers(uci, server).items():
-            if options.get("ns_ip") == address:
-                if is_enabled(uci, peer):
-                    return server, peer
-                return None, None
-    return None, None
-
-
 def get_peer_user(uci, server, peer):
     """
     Return the user linked to a peer.
@@ -322,6 +333,125 @@ def user_fingerprint(uci, server, user):
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
+def build_state(uci):
+    """
+    Collect what the login service needs from the configuration.
+
+    `ns-wgauth sync` writes it to `STATE_FILE` when the configuration is applied, and the daemon works only on it:
+    a change saved but not applied yet, kept by UCI in /tmp/.uci and visible to every reader, must not open the
+    gate or end sessions before the administrator applies it.
+
+    Arguments:
+      - uci -- EUci pointer
+
+    Returns:
+      - a dictionary with the login service settings and, in `servers`, the gated servers with their enabled
+        peers by reserved IP. A peer without a valid user has an empty `user`
+    """
+    servers = {}
+    for server in list_gated_servers(uci):
+        peers = {}
+        for peer, options in list_peers(uci, server).items():
+            address = options.get("ns_ip", "")
+            if not address or not is_enabled(uci, peer):
+                continue
+            entry = {
+                "peer": peer,
+                "public_key": options.get("public_key", ""),
+                "user": "",
+                "password": "",
+                "otp_secret": "",
+                "fingerprint": "",
+            }
+            user = get_peer_user(uci, server, peer)
+            if user is not None:
+                entry.update(
+                    user=user.get("name", ""),
+                    password=user.get("password", ""),
+                    otp_secret=user.get("openvpn_2fa", ""),
+                    fingerprint=user_fingerprint(uci, server, user),
+                )
+            peers[address] = entry
+        servers[server] = {
+            "name": uci.get("network", server, "ns_name", default=server),
+            "enabled": is_enabled(uci, server),
+            "address": get_server_address(uci, server),
+            "otp": requires_otp(uci, server),
+            "timeout": get_session_timeout(uci, server),
+            "database": uci.get("network", server, "ns_user_db", default=""),
+            "peers": peers,
+        }
+    return {
+        "port": get_port(uci),
+        "idle_timeout": get_idle_timeout(uci),
+        "lock_endpoint": get_lock_endpoint(uci),
+        "detect_copies": _get_flag(uci, "detect_copies", True),
+        "block_copies": _get_flag(uci, "block_copies", False),
+        "max_failures": _get_count(uci, "max_failures", DEFAULT_MAX_FAILURES),
+        "lockout_time": _get_count(uci, "lockout_time", DEFAULT_LOCKOUT_TIME),
+        "servers": servers,
+    }
+
+
+def _read_json(path, default):
+    try:
+        with open(path) as fp:
+            return json.load(fp)
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path, data):
+    # readable by root only: the state holds password hashes and OTP secrets
+    temporary = path + ".tmp"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fp:
+        json.dump(data, fp)
+    os.replace(temporary, path)
+
+
+def save_state(state):
+    """
+    Write the configuration snapshot the daemon works on, see `build_state`.
+
+    Arguments:
+      - state -- the dictionary returned by `build_state`
+    """
+    os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+    _write_json(STATE_FILE, state)
+
+
+def load_state():
+    """
+    Read the configuration snapshot written by `save_state`.
+
+    Returns:
+      - the snapshot, None if it's missing or unreadable
+    """
+    state = _read_json(STATE_FILE, None)
+    if not isinstance(state, dict) or not isinstance(state.get("servers"), dict):
+        return None
+    return state
+
+
+def find_peer(state, address):
+    """
+    Find the peer that can log in from an address.
+
+    Arguments:
+      - state -- see `build_state`
+      - address -- IPv4 address of the client inside the VPN
+
+    Returns:
+      - a `(server, peer)` tuple, `peer` being the entry of the enabled peer of an enabled gated server whose
+        reserved IP is `address`; `(None, None)` if there is no such peer
+    """
+    for server, config in sorted(state["servers"].items()):
+        if config["enabled"] and address in config["peers"]:
+            return server, config["peers"][address]
+    return None, None
+
+
 def verify_otp(secret, code):
     """
     Verify a TOTP code, accepting the previous and the next 30 seconds window for clock drift.
@@ -344,38 +474,34 @@ def verify_otp(secret, code):
         return False
 
 
-def check_credentials(uci, server, peer, username, password, otp=""):
+def check_login(state, server, peer, username, password, otp=""):
     """
     Check the credentials entered on the login page against the user linked to the peer.
 
     Arguments:
-      - uci -- EUci pointer
+      - state -- see `build_state`
       - server -- WireGuard server interface name
-      - peer -- peer section name
+      - peer -- the peer entry returned by `find_peer`
       - username -- the user name entered, it must match the linked user (case insensitive)
       - password -- the password entered
       - otp -- the OTP code entered, checked only if the server requires it
 
     Returns:
-      - the user object if the credentials are valid, None otherwise
+      - True if the credentials are valid
     """
-    user = get_peer_user(uci, server, peer)
-    if user is None:
-        return None
-    if not isinstance(username, str) or username.lower() != user.get("name", "").lower():
-        return None
-    shadow = user.get("password", "")
+    name = peer.get("user", "")
+    if not name or not isinstance(username, str) or username.lower() != name.lower():
+        return False
+    shadow = peer.get("password", "")
     if not shadow or not isinstance(password, str) or not password:
-        return None
+        return False
     try:
         if not users.check_password(password, shadow):
-            return None
+            return False
     except (TypeError, ValueError):
         # malformed password hash
-        return None
-    if requires_otp(uci, server) and not verify_otp(user.get("openvpn_2fa", ""), otp):
-        return None
-    return user
+        return False
+    return not state["servers"][server]["otp"] or verify_otp(peer.get("otp_secret", ""), otp)
 
 
 def ensure_otp_secret(uci, user):
@@ -415,13 +541,30 @@ def _run(cmd, input=None):
     return subprocess.run(cmd, check=False, input=input, capture_output=True, text=True)
 
 
-def _nft_script(script):
+def _nft_script(script, check=False):
     try:
-        process = _run(["nft", "-f", "-"], input=script)
+        process = _run(["nft", "-c", "-f", "-"] if check else ["nft", "-f", "-"], input=script)
     except OSError as error:
         raise RuntimeError(f"nft failed: {error}") from error
     if process.returncode != 0:
         raise RuntimeError(f"nft failed: {process.stderr.strip()}")
+
+
+def check_script(script):
+    """
+    Ask nftables if it would accept a script, without changing anything.
+
+    Arguments:
+      - script -- see `build_ruleset`
+
+    Returns:
+      - None if the script is valid, the error otherwise
+    """
+    try:
+        _nft_script(script, check=True)
+    except RuntimeError as error:
+        return str(error)
+    return None
 
 
 def read_table():
@@ -459,8 +602,8 @@ def parse_sessions(objects):
         if not nft_set or not nft_set.get("name", "").startswith("auth_"):
             continue
         elements = {}
-        for element in nft_set.get("elem", []):
-            left = 0
+        for item_element in nft_set.get("elem", []):
+            element, left = item_element, 0
             if isinstance(element, dict):
                 element = element.get("elem", {})
                 left = element.get("expires", element.get("timeout", 0))
@@ -479,6 +622,19 @@ def list_sessions():
       - a dictionary `{server: {address: seconds_left}}`
     """
     return parse_sessions(read_table())
+
+
+def gate_status():
+    """
+    Tell what the firewall enforces.
+
+    Returns:
+      - a dictionary with `sessions`, see `list_sessions`, and `blocked`, the servers whose VPN is blocked
+        because the login rules couldn't be loaded
+    """
+    blocked = _read_json(BLOCKED_FILE, {})
+    servers = blocked.get("servers", []) if isinstance(blocked, dict) else []
+    return {"sessions": list_sessions(), "blocked": sorted(servers)}
 
 
 def build_ruleset(servers, port):
@@ -517,13 +673,14 @@ def build_ruleset(servers, port):
     ]
     for server in servers:
         device = json.dumps(server)
+        unauth = f"iifname {device} ip saddr != @auth_{server}"
         lines += [
             # WireGuard server networks are IPv4 only
             f"add rule {table} input iifname {device} meta nfproto ipv6 drop",
-            f"add rule {table} input iifname {device} ip saddr != @auth_{server} jump unauth_input",
+            f"add rule {table} input {unauth} jump unauth_input",
             f"add rule {table} forward iifname {device} meta nfproto ipv6 drop",
-            f"add rule {table} forward iifname {device} ip saddr != @auth_{server} meta l4proto tcp reject with tcp reset",
-            f"add rule {table} forward iifname {device} ip saddr != @auth_{server} reject with icmpx type admin-prohibited",
+            f"add rule {table} forward {unauth} meta l4proto tcp reject with tcp reset",
+            f"add rule {table} forward {unauth} reject with icmpx type admin-prohibited",
             f"add rule {table} forward oifname {device} meta nfproto ipv6 drop",
             f"add rule {table} forward oifname {device} ip daddr != @auth_{server} drop",
         ]
@@ -534,6 +691,39 @@ def build_ruleset(servers, port):
         f"add rule {table} unauth_input meta l4proto tcp reject with tcp reset",
         f"add rule {table} unauth_input reject with icmpx type admin-prohibited",
     ]
+    return "\n".join(lines) + "\n"
+
+
+def build_block_ruleset(servers):
+    """
+    Build the nftables script that blocks all the traffic of the gated servers, used when the login rules can't be
+    loaded: nobody can log in, but nobody gets through with the key alone either.
+
+    It replaces the whole table and uses only plain matches and a numeric priority, so it doesn't depend on the
+    syntax of `build_ruleset`.
+
+    Arguments:
+      - servers -- the gated servers
+
+    Returns:
+      - the script for `nft -f`
+    """
+    table = f"inet {TABLE}"
+    lines = [
+        # adding the table first lets the delete work when it doesn't exist
+        f"add table {table}",
+        f"delete table {table}",
+        f"add table {table}",
+        f"add chain {table} input {{ type filter hook input priority -1; policy accept; }}",
+        f"add chain {table} forward {{ type filter hook forward priority -1; policy accept; }}",
+    ]
+    for server in servers:
+        device = json.dumps(server)
+        lines += [
+            f"add rule {table} input iifname {device} drop",
+            f"add rule {table} forward iifname {device} drop",
+            f"add rule {table} forward oifname {device} drop",
+        ]
     return "\n".join(lines) + "\n"
 
 
@@ -571,32 +761,81 @@ def table_matches(objects, servers):
     return rules == {"input": 1 + 2 * count, "forward": 5 * count, "unauth_input": 4}
 
 
-def apply_ruleset(uci, force=True):
+def _interface(server, action):
+    try:
+        process = _run(["ubus", "call", "network.interface", action, json.dumps({"interface": server})])
+    except OSError:
+        return False
+    return process.returncode == 0
+
+
+def _block(servers, error):
+    """Fail closed: block the gated servers, or take their interfaces down if even that fails."""
+    previous = _read_json(BLOCKED_FILE, {})
+    previous = previous if isinstance(previous, dict) else {}
+    down = set(previous.get("down", []))
+    try:
+        _nft_script(build_block_ruleset(servers))
+    except RuntimeError as block_error:
+        if previous.get("error") != error:
+            log(f"cannot block the VPN of {', '.join(servers)}, taking it down: {block_error}", syslog.LOG_ERR)
+        down.update(server for server in servers if _interface(server, "down"))
+    else:
+        if previous.get("error") != error:
+            log(f"cannot load the login rules, the VPN of {', '.join(servers)} is blocked: {error}", syslog.LOG_ERR)
+    os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+    _write_json(BLOCKED_FILE, {"servers": sorted(servers), "down": sorted(down), "error": error})
+
+
+def _unblock(state):
+    blocked = _read_json(BLOCKED_FILE, None)
+    if blocked is None:
+        return
+    for server in blocked.get("down", []) if isinstance(blocked, dict) else []:
+        # it was enabled when taken down: only a server disabled since stays down
+        if state["servers"].get(server, {}).get("enabled", True):
+            _interface(server, "up")
+    os.remove(BLOCKED_FILE)
+    log("the login rules are loaded, the VPN is no longer blocked")
+
+
+def apply_ruleset(state, force=True):
     """
     Create, update or remove the `inet ns_wgauth` table to match the configuration.
 
+    If nftables refuses the login rules and the table in place doesn't gate every server, the servers are blocked
+    instead, see `build_block_ruleset`. The error is raised either way.
+
     Arguments:
-      - uci -- EUci pointer
+      - state -- see `build_state`
       - force -- rebuild the chains even if the table looks complete
 
     Returns:
       - the list of gated servers
     """
-    servers = list_gated_servers(uci)
+    servers = sorted(state["servers"])
     objects = read_table()
     if not servers:
         if objects:
             _nft_script(f"delete table inet {TABLE}\n")
+        _unblock(state)
         return servers
     if not force and table_matches(objects, servers):
         return servers
-    _nft_script(build_ruleset(servers, get_port(uci)))
+    try:
+        _nft_script(build_ruleset(servers, state["port"]))
+    except RuntimeError as error:
+        # the rules already in place, for example with the previous port, still gate every server
+        if not table_matches(objects, servers):
+            _block(servers, str(error))
+        raise
     # a set can be deleted only after the rules using it, so outside the main script
     wanted = {f"auth_{server}" for server in servers}
     for item in objects:
         name = item.get("set", {}).get("name", "")
         if name.startswith("auth_") and name not in wanted:
             _run(["nft", "delete", "set", "inet", TABLE, name])
+    _unblock(state)
     return servers
 
 
@@ -616,7 +855,7 @@ def state_lock():
             return
         import fcntl
 
-        os.makedirs(RUN_DIR, exist_ok=True)
+        os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
         with open(LOCK_FILE, "a") as fp:
             fcntl.flock(fp, fcntl.LOCK_EX)
             _lock_depth = 1
@@ -633,11 +872,7 @@ def load_metadata():
     Returns:
       - a dictionary `{server: {address: entry}}`
     """
-    try:
-        with open(SESSIONS_FILE) as fp:
-            data = json.load(fp)
-    except (OSError, ValueError):
-        return {}
+    data = _read_json(SESSIONS_FILE, {})
     return data if isinstance(data, dict) else {}
 
 
@@ -648,11 +883,8 @@ def save_metadata(data):
     Arguments:
       - data -- a dictionary `{server: {address: entry}}`
     """
-    os.makedirs(RUN_DIR, exist_ok=True)
-    temporary = SESSIONS_FILE + ".tmp"
-    with open(temporary, "w") as fp:
-        json.dump({server: entries for server, entries in data.items() if entries}, fp)
-    os.replace(temporary, SESSIONS_FILE)
+    os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+    _write_json(SESSIONS_FILE, {server: entries for server, entries in data.items() if entries})
 
 
 def _element(server, address):
@@ -665,23 +897,22 @@ def _flush_connections(address):
     _run(["conntrack", "-D", "-d", address])
 
 
-def open_session(uci, server, peer, address, user):
+def open_session(state, server, address, peer, endpoint=""):
     """
     Let a peer through after a successful login, or restart the timer of its session.
 
     Arguments:
-      - uci -- EUci pointer
+      - state -- see `build_state`
       - server -- WireGuard server interface name
-      - peer -- peer section name
       - address -- reserved IP of the peer
-      - user -- the user object returned by `check_credentials`
+      - peer -- the peer entry returned by `find_peer`
+      - endpoint -- public IP the peer sends from, see `read_endpoints`
 
     Returns:
       - the expiration time, as a UNIX timestamp
     """
     address = str(ipaddress.IPv4Address(address))
-    timeout = get_session_timeout(uci, server)
-    endpoint = (read_endpoints() or {}).get(uci.get("network", peer, "public_key", default=""), "")
+    timeout = state["servers"][server]["timeout"]
     now = int(time.time())
     with state_lock():
         # adding an element before deleting it can't fail if it's missing
@@ -692,15 +923,16 @@ def open_session(uci, server, peer, address, user):
         )
         metadata = load_metadata()
         metadata.setdefault(server, {})[address] = {
-            "peer": peer,
-            "user": user.get("name", ""),
-            "fingerprint": user_fingerprint(uci, server, user),
+            "peer": peer["peer"],
+            "public_key": peer["public_key"],
+            "user": peer["user"],
+            "fingerprint": peer["fingerprint"],
             "login": now,
             "expires": now + timeout,
             "endpoint": endpoint,
         }
         save_metadata(metadata)
-    log(f"login: user={user.get('name', '')} server={server} peer={peer} address={address} from={endpoint}")
+    log(f"login: user={peer['user']} server={server} peer={peer['peer']} address={address} from={endpoint}")
     return now + timeout
 
 
@@ -788,55 +1020,338 @@ def read_endpoints():
     return endpoints
 
 
-def session_problem(uci, server, address, entry, handshakes, now, idle_timeout, gated, endpoints=None):
+def load_alerts():
+    """
+    Read the alerts of the peers: suspected copies of their configuration and lockouts.
+
+    Returns:
+      - a dictionary `{peer: {"public_key": key, "blocked": bool, "events": [event]}}`, every event being
+        `{"time": timestamp, "type": "copy" or "lockout", "user": name, "addresses": [ip]}`
+    """
+    data = _read_json(ALERTS_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_alerts(alerts):
+    """
+    Write the alerts, see `load_alerts`.
+
+    Arguments:
+      - alerts -- the dictionary returned by `load_alerts`
+    """
+    os.makedirs(os.path.dirname(ALERTS_FILE), mode=0o700, exist_ok=True)
+    _write_json(ALERTS_FILE, alerts)
+
+
+def peer_alerts(alerts, peer, public_key):
+    """
+    Return the alerts of a peer.
+
+    The alerts belong to the keys of the peer: once new keys are generated, the old ones, and the copies made of
+    them, don't matter anymore.
+
+    Arguments:
+      - alerts -- see `load_alerts`
+      - peer -- peer section name
+      - public_key -- the current public key of the peer
+
+    Returns:
+      - the alert entry, None if the peer has none for its current keys
+    """
+    entry = alerts.get(peer)
+    if isinstance(entry, dict) and public_key and entry.get("public_key") == public_key:
+        return entry
+    return None
+
+
+def is_blocked(peer, alerts=None):
+    """
+    Check if a peer is blocked after a suspected copy of its configuration.
+
+    Arguments:
+      - peer -- the peer entry returned by `find_peer`
+      - alerts -- see `load_alerts`, read from the file if missing
+
+    Returns:
+      - True if the peer is blocked
+    """
+    alerts = load_alerts() if alerts is None else alerts
+    entry = peer_alerts(alerts, peer["peer"], peer["public_key"])
+    return bool(entry and entry.get("blocked"))
+
+
+def add_alert(peer, public_key, kind, user, addresses, block=False):
+    """
+    Record an alert for a peer, written to `ALERTS_FILE`.
+
+    Arguments:
+      - peer -- peer section name
+      - public_key -- the current public key of the peer
+      - kind -- `copy` or `lockout`
+      - user -- the user linked to the peer
+      - addresses -- the public IPs involved
+      - block -- block the peer until an administrator clears its alerts or generates new keys
+    """
+    now = int(time.time())
+    with state_lock():
+        alerts = load_alerts()
+        entry = peer_alerts(alerts, peer, public_key) or {"public_key": public_key, "blocked": False, "events": []}
+        events = [
+            event
+            for event in entry.get("events", [])
+            if isinstance(event, dict) and now - _timestamp(event.get("time")) < ALERT_AGE
+        ]
+        events.append({"time": now, "type": kind, "user": user, "addresses": [ip for ip in addresses if ip]})
+        entry["events"] = events[-MAX_ALERTS:]
+        entry["blocked"] = bool(entry.get("blocked")) or block
+        alerts[peer] = entry
+        save_alerts(alerts)
+
+
+def clear_alerts(peer):
+    """
+    Forget the alerts of a peer, and unblock it.
+
+    Arguments:
+      - peer -- peer section name
+
+    Returns:
+      - True if the peer had alerts
+    """
+    with state_lock():
+        alerts = load_alerts()
+        if alerts.pop(peer, None) is None:
+            return False
+        save_alerts(alerts)
+    log(f"alerts cleared: peer={peer}")
+    return True
+
+
+def prune_alerts(uci):
+    """
+    Forget the alerts of the peers removed, or whose keys were generated again.
+
+    Arguments:
+      - uci -- EUci pointer
+    """
+    with state_lock():
+        alerts = load_alerts()
+        kept = {
+            peer: entry
+            for peer, entry in alerts.items()
+            if isinstance(entry, dict)
+            and entry.get("public_key")
+            and uci.get("network", peer, "public_key", default="") == entry["public_key"]
+        }
+        if kept != alerts:
+            save_alerts(kept)
+
+
+class CopyDetector:
+    """
+    Spot two devices using the same peer configuration at once.
+
+    WireGuard sends to the public IP of the latest packet received, so while two devices with the same key are
+    active the endpoint of the peer keeps switching between their IPs. A device that changes network switches
+    once, or through new IPs. `observe` reports a key whose endpoint changed `COPY_CHANGES` times within
+    `COPY_WINDOW` seconds, going back to an IP it already had.
+    """
+
+    def __init__(self, window=COPY_WINDOW, changes=COPY_CHANGES):
+        self.window = window
+        self.changes = changes
+        # public key -> latest IP seen
+        self.last = {}
+        # public key -> [(time, previous ip, new ip)] of the changes in the window
+        self.history = {}
+
+    def observe(self, endpoints, now):
+        """
+        Record the current endpoints.
+
+        Arguments:
+          - endpoints -- see `read_endpoints`, limited to the peers to watch
+          - now -- current UNIX timestamp
+
+        Returns:
+          - a dictionary `{public_key: [ip]}` of the keys that look used by more than one device
+        """
+        suspects = {}
+        for public_key, address in endpoints.items():
+            previous = self.last.get(public_key)
+            self.last[public_key] = address
+            if previous is None or previous == address:
+                continue
+            changes = [change for change in self.history.get(public_key, []) if now - change[0] < self.window]
+            changes.append((now, previous, address))
+            self.history[public_key] = changes
+            seen = {changes[0][1]} | {change[2] for change in changes}
+            # a return to an IP already seen: with only new IPs it's a device moving
+            if len(changes) >= self.changes and len(seen) <= len(changes):
+                suspects[public_key] = sorted(seen)
+                self.history[public_key] = []
+        for public_key in set(self.last) - set(endpoints):
+            del self.last[public_key]
+            self.history.pop(public_key, None)
+        return suspects
+
+
+class LoginFailures:
+    """
+    Count the failed logins of each peer by public IP of the client.
+
+    Someone using a copy of the configuration from another network can't lock out the real user. A peer failing
+    `PEER_FAILURE_FACTOR` times `max_failures` from many IPs is locked out from all of them, except the IP of its
+    latest successful login, so the IPs don't multiply the attempts.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        # peer -> [(time, ip)] of the recent failures
+        self.failures = {}
+        # peer -> ip of the latest successful login
+        self.trusted = {}
+
+    def _recent(self, peer, now, lockout_time):
+        recent = [failure for failure in self.failures.get(peer, []) if now - failure[0] < lockout_time]
+        self.failures[peer] = recent
+        return recent
+
+    def locked_until(self, peer, endpoint, now, max_failures, lockout_time):
+        """
+        Check if a peer can try to log in from an IP.
+
+        Arguments:
+          - peer -- peer section name
+          - endpoint -- public IP of the client, empty if unknown
+          - now -- current UNIX timestamp
+          - max_failures -- failures from one IP before it's locked out
+          - lockout_time -- seconds a lockout lasts
+
+        Returns:
+          - the end of the lockout as a UNIX timestamp, None if the login can be tried
+        """
+        with self.lock:
+            recent = self._recent(peer, now, lockout_time)
+            own = [moment for moment, source in recent if source == endpoint]
+            if len(own) >= max_failures:
+                return own[-1] + lockout_time
+            if endpoint != self.trusted.get(peer) and len(recent) >= max_failures * PEER_FAILURE_FACTOR:
+                return recent[-1][0] + lockout_time
+        return None
+
+    def add(self, peer, endpoint, now, max_failures, lockout_time):
+        """
+        Record a failed login, see `locked_until` for the arguments.
+
+        Returns:
+          - the IPs locked out by this failure, empty if it locked out nothing new
+        """
+        with self.lock:
+            recent = self._recent(peer, now, lockout_time)
+            recent.append((now, endpoint))
+            if sum(1 for _, source in recent if source == endpoint) == max_failures:
+                return [endpoint]
+            if len(recent) == max_failures * PEER_FAILURE_FACTOR:
+                return sorted({source for _, source in recent})
+        return []
+
+    def success(self, peer, endpoint):
+        """
+        Record a successful login: the failures from its IP are forgotten, the others stay.
+
+        Arguments:
+          - peer -- peer section name
+          - endpoint -- public IP of the client
+        """
+        with self.lock:
+            self.failures[peer] = [failure for failure in self.failures.get(peer, []) if failure[1] != endpoint]
+            self.trusted[peer] = endpoint
+
+
+def report_copy(state, public_key, addresses):
+    """
+    Handle a suspected copy of a peer configuration, see `CopyDetector`: end the session of the peer, log it and
+    record the alert, at most once every `COPY_REPORT_INTERVAL`, and with `block_copies` block the peer until an
+    administrator clears the alert or generates new keys.
+
+    Arguments:
+      - state -- see `build_state`
+      - public_key -- the public key used by more than one device
+      - addresses -- the public IPs seen
+
+    Returns:
+      - the peer section name, None if the key isn't a peer of a gated server
+    """
+    now = int(time.time())
+    for server, config in sorted(state["servers"].items()):
+        for address, peer in config["peers"].items():
+            if peer["public_key"] != public_key:
+                continue
+            block = state["block_copies"]
+            entry = peer_alerts(load_alerts(), peer["peer"], public_key) or {}
+            reported = any(
+                isinstance(event, dict)
+                and event.get("type") == "copy"
+                and now - _timestamp(event.get("time")) < COPY_REPORT_INTERVAL
+                for event in entry.get("events", [])
+            )
+            if not reported or (block and not entry.get("blocked")):
+                log(
+                    f"possible copy of the configuration of peer {peer['peer']}: user={peer['user']} "
+                    f"used from {', '.join(addresses)} at the same time" + (", peer blocked" if block else ""),
+                    syslog.LOG_WARNING,
+                )
+                add_alert(peer["peer"], public_key, "copy", peer["user"], addresses, block=block)
+            close_session(server, address, "copy_suspected")
+            return peer["peer"]
+    return None
+
+
+def session_problem(state, server, address, entry, handshakes, now, endpoints=None, blocked=()):
     """
     Check if an open session must end.
 
     Arguments:
-      - uci -- EUci pointer
+      - state -- see `build_state`
       - server -- WireGuard server interface name
       - address -- reserved IP of the peer
       - entry -- the session metadata, see `load_metadata`
       - handshakes -- see `read_handshakes`, None skips the check of disconnected peers
       - now -- current UNIX timestamp
-      - idle_timeout -- see `get_idle_timeout`
-      - gated -- the gated servers
       - endpoints -- see `read_endpoints`, None skips the check of the public IP
+      - blocked -- the peer section names that are blocked
 
     Returns:
       - the reason to end the session, None if it's still valid
     """
-    if server not in gated or not is_enabled(uci, server):
+    config = state["servers"].get(server)
+    if config is None or not config["enabled"]:
         return "server_changed"
     if not isinstance(entry, dict):
         return "unknown_session"
-    peer = entry.get("peer", "")
-    if (
-        not peer
-        or uci.get("network", peer, default="") != f"wireguard_{server}"
-        or not is_enabled(uci, peer)
-        or uci.get("network", peer, "ns_ip", default="") != address
-    ):
+    peer = config["peers"].get(address)
+    if peer is None or peer["peer"] != entry.get("peer") or peer["public_key"] != entry.get("public_key"):
         return "peer_changed"
-    user = get_peer_user(uci, server, peer)
-    if user is None or user.get("name", "").lower() != str(entry.get("user", "")).lower():
+    if not peer["user"] or peer["user"].lower() != str(entry.get("user", "")).lower():
         return "user_changed"
-    if user_fingerprint(uci, server, user) != entry.get("fingerprint"):
+    if peer["fingerprint"] != entry.get("fingerprint"):
         return "user_changed"
-    public_key = uci.get("network", peer, "public_key", default="")
-    if endpoints is not None and entry.get("endpoint"):
+    if peer["peer"] in blocked:
+        return "blocked"
+    if endpoints is not None and state["lock_endpoint"] == "strict" and entry.get("endpoint"):
         # unknown right after an interface restart, until the peer sends again
-        current = endpoints.get(public_key)
+        current = endpoints.get(peer["public_key"])
         if current and current != entry["endpoint"]:
             return "endpoint_changed"
-    if handshakes is not None and idle_timeout > 0:
+    if handshakes is not None and state["idle_timeout"] > 0:
         # restarting the interface resets the handshakes: count from the latest one ever seen, or from the login
         latest = max(
-            handshakes.get(public_key, 0),
+            handshakes.get(peer["public_key"], 0),
             _timestamp(entry.get("seen")),
             _timestamp(entry.get("login")),
         )
-        if now - latest > idle_timeout:
+        if now - latest > state["idle_timeout"]:
             return "disconnected"
     return None
 
@@ -845,12 +1360,12 @@ def _timestamp(value):
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def reconcile(uci):
+def reconcile(state):
     """
     End the sessions that are no longer valid and forget the expired ones.
 
     Arguments:
-      - uci -- EUci pointer
+      - state -- see `build_state`
 
     Returns:
       - the list of `(server, address, reason)` of the ended sessions
@@ -859,35 +1374,42 @@ def reconcile(uci):
     with state_lock():
         sessions = list_sessions()
         metadata = load_metadata()
-        gated = list_gated_servers(uci)
-        idle_timeout = get_idle_timeout(uci)
-        handshakes = read_handshakes() if idle_timeout > 0 else None
-        endpoints = read_endpoints() if get_lock_endpoint(uci) else None
+        handshakes = read_handshakes() if state["idle_timeout"] > 0 else None
+        endpoints = read_endpoints() if state["lock_endpoint"] != "off" else None
+        alerts = load_alerts()
+        blocked = {
+            peer["peer"]
+            for config in state["servers"].values()
+            for peer in config["peers"].values()
+            if is_blocked(peer, alerts)
+        }
         now = int(time.time())
         changed = False
         for server, elements in sessions.items():
             for address in elements:
                 entry = metadata.get(server, {}).get(address)
-                reason = session_problem(uci, server, address, entry, handshakes, now, idle_timeout, gated, endpoints)
+                reason = session_problem(state, server, address, entry, handshakes, now, endpoints, blocked)
                 if reason:
                     ended.append((server, address, reason))
-                if reason == "endpoint_changed":
-                    public_key = uci.get("network", entry["peer"], "public_key", default="")
-                    log(
-                        f"possible copy of the configuration of peer {entry['peer']}: user={entry.get('user', '')} "
-                        f"logged in from {entry['endpoint']}, now {endpoints[public_key]}",
-                        syslog.LOG_WARNING,
-                    )
-                if reason or not isinstance(entry, dict):
+                    if reason == "endpoint_changed":
+                        public_key = state["servers"][server]["peers"][address]["public_key"]
+                        log(
+                            f"peer {entry['peer']} of user={entry.get('user', '')} sends from {endpoints[public_key]}, "
+                            f"it logged in from {entry['endpoint']}: the user must log in again"
+                        )
                     continue
-                public_key = uci.get("network", entry["peer"], "public_key", default="")
+                public_key = state["servers"][server]["peers"][address]["public_key"]
                 latest = (handshakes or {}).get(public_key, 0)
                 if latest > _timestamp(entry.get("seen")):
                     entry["seen"] = latest
                     changed = True
-                # the endpoint wasn't known at login
-                if endpoints and not entry.get("endpoint") and endpoints.get(public_key):
-                    entry["endpoint"] = endpoints[public_key]
+                current = (endpoints or {}).get(public_key)
+                if current and current != entry.get("endpoint"):
+                    # unknown at login, or the client moved to another network with lock_endpoint set to roaming
+                    if entry.get("endpoint"):
+                        user = entry.get("user", "")
+                        log(f"peer {entry['peer']} of user={user} moved from {entry['endpoint']} to {current}")
+                    entry["endpoint"] = current
                     changed = True
         if changed:
             save_metadata(metadata)
