@@ -9005,6 +9005,86 @@ api-cli ns.wireguard delete-tunnel --data '{"id": "wg4"}'
 Parameters:
 - `id`: the id of the tunnel, it can be found in the `list-tunnels` output
 
+### connection-history
+
+Read a page of the connection history of the peers of the servers, newest first by default:
+```
+api-cli ns.wireguard connection-history --data '{"instances": ["wg1"], "q": "", "page": 1, "per_page": 10, "sort_by": "startTime", "desc": true}'
+```
+
+WireGuard has no connections: `/usr/libexec/wireguard-history` reads `wg show all dump` every minute, from cron,
+and keeps a row while the handshakes of a peer keep coming. A row ends when the latest handshake is older than 3
+minutes, when the peer comes from another public address, or when its interface restarts. The rows are in
+`<data storage>/wireguard/connections.db`, or `/var/wireguard/connections.db` without a data storage, lost at reboot.
+The client tunnels have no history. See `nethsec.wghistory`.
+
+All the parameters are optional:
+- `instances`: the servers to include, all if empty
+- `q`: text in the name of the peer, its user, its addresses or its server
+- `start_time`: only the connections started from this time, seconds since 1970
+- `accounts`: the names of the peers to include, all if empty
+- `page`, `per_page`: the page, 10 rows by default, at most 1000
+- `sort_by`: `startTime` (default), `endTime`, `duration`, `account`, `user`, `instance`, `virtualIpAddress`,
+  `remoteIpAddress`, `bytesReceived` or `bytesSent`
+- `desc`: descending order, default `true`
+
+Response example:
+```json
+{
+  "connections": [
+    {
+      "instance": "wg1",
+      "peer": "wg1_ns_76e103f5_peer",
+      "account": "Alice laptop",
+      "user": "alice",
+      "virtualIpAddress": "10.1.122.2",
+      "remoteIpAddress": "198.51.100.7",
+      "startTime": 1729592489,
+      "endTime": null,
+      "duration": 3610,
+      "connected": true,
+      "bytesReceived": 9605402,
+      "bytesSent": 33898343
+    }
+  ],
+  "current_page": 1,
+  "last_page": 1,
+  "per_page": 10,
+  "total": 1,
+  "results": 1,
+  "filters": {"accounts": ["Alice laptop"], "instances": ["wg1"]},
+  "server_names": {"wg1": "HQ"}
+}
+```
+
+- `account`: the name of the peer at the time of the connection; `user`: its linked user, see the login of a server
+- `endTime`: `null` while connected; `duration` counts up to now while connected
+- `bytesReceived`: from the peer, `bytesSent`: to the peer
+- `total`: all the rows of the history, `results`: the rows that match the filters
+- `server_names`: the names of the servers that exist, by interface
+
+Validation errors: `invalid` for `instances`, `accounts`, `start_time`, `page`, `per_page`. Generic error
+`database_error` if the history can't be read; without a history yet, the list is empty.
+
+### connection-history-csv
+
+Write all the connection history in a CSV file, newest first, with the times in a time zone:
+```
+api-cli ns.wireguard connection-history-csv --data '{"instances": [], "timezone": "Europe/Rome"}'
+```
+
+- `instances` (optional): the servers to include, all if empty
+- `timezone` (optional): the time zone of the times, `UTC` if missing or unknown
+
+Response example:
+```json
+{
+  "csv_path": "/var/run/ns-api-server/downloads/wireguard_connection_history.csv"
+}
+```
+
+Generic error `database_error` if the history can't be read.
+
 ### ns.ha
 
 The following APIs are available for managing High Availability (HA) configuration. 
