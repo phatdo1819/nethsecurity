@@ -8649,12 +8649,14 @@ Response example:
   "instance": "wg3",
   "network": "10.245.149.0/24",
   "public_endpoint": "79.19.71.172",
-  "auth_modes": ["key", "key_password", "key_password_otp"]
+  "auth_modes": ["key", "key_password", "key_password_otp"],
+  "max_fallback_endpoints": 4
 }
 ```
 
 `auth_modes` lists the values accepted by the `auth_mode` parameter of `add-server`: a client can show the login
-options only when it's present.
+options only when it's present. `max_fallback_endpoints` is the most `fallback_endpoints` a server can have: a client
+can show them only when it's present.
 
 ### list-servers
 
@@ -8674,6 +8676,7 @@ Response example:
       "address": "10.1.122.1",
       "network": "10.1.122.0/24",
       "public_endpoint": "127.0.0.1",
+      "fallback_endpoints": ["vpn2.example.com"],
       "enabled": true,
       "peers": [
         {
@@ -8745,6 +8748,11 @@ Parameters:
 - `enabled`: create the instance as active if `true`, inactive if `false`
 - `name`: the name of the instance
 - `public_endpoint`: the public endpoint of the WireGuard server, it can be an IP address or a domain name, it's used during the client configuration creation
+- `fallback_endpoints` (optional): up to 4 other addresses of the server, tried in order by the clients when the
+  public endpoint doesn't answer, e.g. the IP of a second internet connection. Each one is an IP address or a domain
+  name, with an optional port (`vpn2.example.com`, `203.0.113.10:51821`, `[2001:db8::1]:51820`): without a port, the
+  `listen_port`. The peer configurations list them, with their port, in a comment after `Endpoint`, which the
+  clients that don't support it ignore: `# Fallback = vpn2.example.com:51820, 203.0.113.10:51821`
 - `listen_port`: the port where the WireGuard server listens
 - `network`: the network of the WireGuard instance, this is the client subnet
 - `mtu`: the MTU of the WireGuard interface, if kept empty auto-detection will be used
@@ -8758,6 +8766,9 @@ Example of a server that requires the login:
 ```
 api-cli ns.wireguard add-server --data '{"enabled": true, "name": "Road warriors", "public_endpoint": "wireguard.example.com", "listen_port": 51823, "network": "10.1.86.0/24", "mtu": "", "dns": [], "auth_mode": "key_password_otp", "user_db": "main", "auth_timeout": 28800}'
 ```
+
+Validation errors of `fallback_endpoints`: `invalid` if it isn't a list of strings, `invalid_endpoint`,
+`duplicate_endpoint` (the public endpoint, or the same endpoint twice), `too_many_endpoints`.
 
 Validation errors of the login parameters:
 - `auth_mode`: `invalid`; `peers_with_remote_networks` on `edit-server` if a peer has remote networks
@@ -8778,7 +8789,8 @@ Parameters:
 - `instance`: the name of the WireGuard instance, the instance must exist
 
 All other parameters are the same as in `add-server`. If `auth_mode` is missing, the login options keep their current
-values; `auth_mode` `key` removes the users database of the server.
+values; `auth_mode` `key` removes the users database of the server. If `fallback_endpoints` is missing, the fallback
+endpoints stay as they are; an empty list removes them.
 
 ### delete-server
 

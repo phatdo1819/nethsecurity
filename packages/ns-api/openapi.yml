@@ -138,6 +138,15 @@ components:
           type: string
           description: IP address or host name written in the client configurations
           example: wireguard.example.com
+        fallback_endpoints:
+          type: array
+          maxItems: 4
+          description: >-
+            Other addresses of the server, tried in order by the clients that support it when the public endpoint
+            doesn't answer; host or host:port, IPv6 in brackets with a port. Missing on edit-server, they stay.
+          items:
+            type: string
+          example: ["vpn2.example.com", "203.0.113.10:51821"]
         mtu:
           type: string
           description: Empty for auto-detection
@@ -880,6 +889,13 @@ paths:
                           type: string
                         enabled:
                           type: boolean
+                        public_endpoint:
+                          type: string
+                        fallback_endpoints:
+                          type: array
+                          description: As written by the administrator, without the default port
+                          items:
+                            type: string
                         auth_mode:
                           $ref: "#/components/schemas/WireGuardAuthMode"
                         user_db:
@@ -910,7 +926,9 @@ paths:
                                 type: string
                               config:
                                 type: string
-                                description: Client configuration, with a "# Login = URL" comment if the login is required
+                                description: >-
+                                  Client configuration, with a "# Login = URL" comment if the login is required and a
+                                  "# Fallback = host:port, ..." comment if the server has fallback endpoints
                               user:
                                 type: string
                                 description: Linked user, empty if none
