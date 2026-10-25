@@ -169,6 +169,24 @@ while the laptop is on Wi-Fi. The detection needs the two devices active at the 
 | `nft delete table inet ns_wgauth` | Within 15 seconds `nft list table inet ns_wgauth` shows it again; users log in again |
 | Reboot the firewall | `nft list table inet ns_wgauth` exists right after boot; users log in again; warnings and blocks are still there |
 
+## 8. Test the fallback endpoints and the connections
+
+**Fallback endpoints**: edit the server, add one under **Fallback endpoints** (e.g. the IP of a second line, or
+`host:port`), save and apply. The downloaded configuration has `# Fallback = ...` after `Endpoint`; the official
+WireGuard apps still connect with `Endpoint`. The VPN Client doesn't use the fallbacks yet.
+
+**Connections**: the new **Connections** tab of the WireGuard page. Connect a peer and wait a minute: a row appears,
+**Connected**, with the public IP of the client and the bytes. Disconnect: about 3 minutes later the row gets its end.
+Check also the CSV download, and on the firewall:
+
+```sh
+grep wireguard-history /etc/crontabs/root   # every minute
+/usr/libexec/wireguard-history; echo $?     # 0
+api-cli ns.wireguard connection-history
+```
+
+The history is in `/var/wireguard/connections.db` (lost at reboot), or on the data storage if there is one.
+
 ## Settings
 
 `/etc/config/ns-wgauth`, changed with `uci`. The changes take effect when applied:
