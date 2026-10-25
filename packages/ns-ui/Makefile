@@ -13,7 +13,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/phatdo1819/nethsecurity-ui.git
 # ci-wgauth: feat/ovpnrw-multi-instance with the WireGuard login
-PKG_SOURCE_VERSION:=375a570303cf6c2727ce8fb04b5942ed3e43c18c
+PKG_SOURCE_VERSION:=1b07dfa6bca871530cfd7b1a85974f812c6f234a
 PKG_SOURCE_SUBDIR:=nethsecurity-ui-$(PKG_SOURCE_VERSION)
 PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_SOURCE_SUBDIR)
 PKG_MIRROR_HASH:=skip

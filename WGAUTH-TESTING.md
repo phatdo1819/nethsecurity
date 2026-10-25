@@ -2,31 +2,32 @@
 
 This branch, `ci-wgauth`, builds a NethSecurity image with the WireGuard login: the peers of a WireGuard server
 must log in on a web page with a username, a password and an OTP code before they can use the VPN.
-A copied peer configuration alone gives no access. How it works: [design document](docs/design/wireguard_user_auth.md)
-and [ns-wgauth](packages/ns-wgauth/README.md).
+A copied peer configuration alone gives no access, and a copy used at the same time as the real device is detected.
+How it works: [design document](docs/design/wireguard_user_auth.md) and [ns-wgauth](packages/ns-wgauth/README.md).
 
 The image also contains everything of `ci-fork`: the Road Warrior multi-server changes and OpenVPN with DCO.
 It's built from the development branch of NethSecurity, newer than 8.8.0: install it only on a test firewall.
 
-## 1. Get the image
+## 1. Build the image
 
-Every push to `ci-wgauth` builds the image on GitHub, in 3 to 4 hours.
-
-1. Open <https://github.com/phatdo1819/nethsecurity/actions/workflows/build-main.yml> and pick the latest
-   run of the `ci-wgauth` branch. It must be green.
-2. At the bottom of the run page, under **Artifacts**, download **image**.
-3. Unzip it: inside there is `nethsecurity-8.8.0-dev.<number>.<date>.<commit>-x86-64-generic-squashfs-combined-efi.img.gz`
-   (the name can differ slightly). Don't unpack the `.img.gz` itself.
-
-With the GitHub CLI:
+On an x86_64 Linux machine, Ubuntu 24.04 for example, set up as in [Build on Ubuntu](FORK-TESTING.md#build-on-ubuntu)
+(podman, 4 cores, 8 GB of RAM, 100 GB of disk). Then:
 
 ```sh
-gh run list --repo phatdo1819/nethsecurity --workflow build-main.yml --branch ci-wgauth --limit 3
-gh run download <run id> --repo phatdo1819/nethsecurity --name image
+git clone -b ci-wgauth https://github.com/phatdo1819/nethsecurity.git nethsecurity-wgauth
+cd nethsecurity-wgauth
+./build-nethsec.sh
 ```
 
-To build it yourself instead, follow [Build on Ubuntu](FORK-TESTING.md#build-on-ubuntu) with
-`git clone -b ci-wgauth https://github.com/phatdo1819/nethsecurity.git`.
+The first build takes a few hours; the next ones, after `git pull`, rebuild only what changed. The web UI is
+downloaded from the `ci-wgauth` branch of [nethsecurity-ui](https://github.com/phatdo1819/nethsecurity-ui) at the
+commit written in `packages/ns-ui/Makefile`. The image is
+`bin/targets/x86/64/nethsecurity-8.8.0-dev.<...>-x86-64-generic-squashfs-combined-efi.img.gz`.
+
+If you already have a clone of `ci-fork`, you can use it: `git fetch origin && git checkout ci-wgauth`.
+
+Every push to `ci-wgauth` can also build the image on GitHub (Actions > build-main.yml, artifact **image**), in about
+4 hours; commits marked `[skip ci]` don't start it.
 
 ## 2. Before installing
 
@@ -49,7 +50,7 @@ bash:
 
 ```sh
 FW=root@192.168.1.1
-scp nethsecurity-*-combined-efi.img.gz $FW:/tmp/
+scp bin/targets/x86/64/nethsecurity-*-combined-efi.img.gz $FW:/tmp/
 ssh $FW "sysupgrade -v /tmp/nethsecurity-*-combined-efi.img.gz"
 ```
 
@@ -57,8 +58,22 @@ The firewall reboots, keeping its configuration. After 2 or 3 minutes, log in ag
 
 ```sh
 grep VERSION= /etc/os-release              # 8.8.0-dev...
-ls /usr/sbin/ns-wgauth /etc/init.d/ns-wgauth
+ns-wgauth check
 ```
+
+`ns-wgauth check` asks nftables and nginx whether they accept the login rules, without applying anything. Before any
+server requires the login it prints:
+
+```
+OK      nftables accepts the login rules
+OK      nftables accepts the fallback rules
+OK      nginx accepts its configuration
+OK      no WireGuard server requires the login
+```
+
+An `ERROR` on the first line is the most likely problem of a first run on real hardware: send me the line.
+Nothing is lost if it happens: the firewall then blocks the servers that require the login instead of letting
+their peers in with the key alone (see step 7).
 
 Clear the browser cache (or reload with Ctrl+F5) before opening the web UI, so you get the new one.
 
@@ -76,17 +91,19 @@ Don't forward the login port 8181: the login page is reached through the tunnel.
    - **Authentication**: *Key, user password and OTP*
    - **Users database**: *Local database*
    - **Session length**: 8 hours
+   Editing a server that already has peers, the form lists the peers without a user: they can't log in until you
+   choose one for each of them.
 3. Save, then apply the changes with the button at the top of the page.
 4. **Add peer**: give it a name and choose **User** `alice`. Save and apply.
 5. In the menu of the peer: **Download configuration**, and **Download OTP QR code**. Scan the QR code with an
    authenticator app (Microsoft Authenticator, Google Authenticator, Aegis, 2FAS...).
 
 The server card now shows **Login** and **Login page** (for example `http://10.103.1.1:8181/`), and no
-"Login not enforced" warning. On the firewall:
+"Login not enforced" or "VPN blocked" message. On the firewall:
 
 ```sh
+ns-wgauth check                        # all OK, warnings for peers without a user
 nft list table inet ns_wgauth          # the gate: sets and chains
-pgrep -fa "ns-wgauth serve"            # the login service
 cat /etc/nginx/conf.d/ns-wgauth.conf   # the login page on port 8181
 ```
 
@@ -109,55 +126,83 @@ On a client (Windows, macOS, Linux, Android or iOS WireGuard app), import the co
 On the firewall:
 
 ```sh
-ns-wgauth status                       # open sessions
-grep ns-wgauth /var/log/messages       # logins, failures, logouts
+ns-wgauth status                       # open sessions, with the public IP of each client
+grep ns-wgauth /var/log/messages       # logins, failures, logouts, warnings
 wg show wg1 endpoints                  # use the name of your server: wg1, wg2...
 ```
 
 `wg show wg1 endpoints` must show the **public IP of the client**, not the address of your router.
-If it shows the router for every client, the router rewrites the source of the forwarded traffic: disable the
-IP lock (see [Settings](#settings)), otherwise every client looks the same.
+`ns-wgauth check` warns when two peers send from the same IP. If every client shows the router, the router rewrites
+the source of the forwarded traffic: disable the IP lock (see [Settings](#settings)), otherwise every client looks
+the same and the copy detection can't work.
 
 ## 7. Test the protection
 
+For the copy tests, import the same `.conf` on a second device on another network, for example a phone on 4G
+while the laptop is on Wi-Fi. The detection needs the two devices active at the same time for a minute or two.
+
 | Test | Expected |
 |---|---|
-| Import the same `.conf` on a second device, the owner logged out | The tunnel comes up, only the login page answers |
-| 5 wrong passwords in a row | **Too many failed attempts**, for 15 minutes |
-| The copy used while the owner is logged in, from another network (a phone on 4G, the owner on Wi-Fi) | Within 15 seconds both lose access; the log shows `possible copy of the configuration of peer ...` |
-| The owner changes network (Wi-Fi to 4G) | The session ends, log in again: expected with the IP lock |
+| The copy, the owner logged out | The tunnel comes up, only the login page answers |
+| 5 wrong passwords from the copy | **Too many failed attempts** on the copy for 15 minutes. The owner, on the other network, can still log in. The peer shows a warning icon in the web UI: "locked out after too many failed logins from ..." |
+| The copy and the owner active at the same time, the owner logged in | Within a minute the owner loses the session (IP lock). Within about 2 minutes the peer shows a warning, "used from ... at the same time", and the log `possible copy of the configuration of peer ...` |
+| The same, with `block_copies` set to `1` (see [Settings](#settings)) | The peer shows **Blocked**; the login page says the configuration is blocked, on both devices |
+| Peer menu > **Clear warnings** | The warnings go, a blocked peer can log in again |
+| Peer menu > **Generate new keys**, apply | The old configuration no longer connects, on any device; download the new one, the warnings are gone |
+| The owner changes network (Wi-Fi to 4G) | The session ends, log in again. With `lock_endpoint` set to `roaming` the session continues |
 | Turn the tunnel off for 6 minutes | The session ends |
-| Change the password of `alice` and apply | The session ends |
-| Disable the peer, or **Log out** in the peer menu of the web UI | The session ends |
+| Change the password of `alice` and apply | The session ends. Before you apply, nothing changes: the old password still works |
+| Set the server to *WireGuard key*, save **without applying**, wait a minute | The LAN still needs the login. Apply: it doesn't anymore. Set it back to *Key, user password and OTP* and apply |
+| A peer without a user | The peer shows **No user**; its login page says it isn't linked to a user |
+| Disable the peer, or **Log out** in the peer menu | The session ends |
 | The same OTP code used twice | The second login is refused |
-| `fw4 reload` on the firewall, or edit another peer of the same server and apply | The session stays |
-| Reboot the firewall | `nft list table inet ns_wgauth` exists right after boot; users log in again |
+| `fw4 reload`, or edit another peer of the same server and apply | The session stays |
+| `nft delete table inet ns_wgauth` | Within 15 seconds `nft list table inet ns_wgauth` shows it again; users log in again |
+| Reboot the firewall | `nft list table inet ns_wgauth` exists right after boot; users log in again; warnings and blocks are still there |
 
 ## Settings
 
-`/etc/config/ns-wgauth`, changed with `uci`:
+`/etc/config/ns-wgauth`, changed with `uci`. The changes take effect when applied:
 
 ```sh
-uci set ns-wgauth.config.lock_endpoint='0'   # disable the IP lock
-uci set ns-wgauth.config.idle_timeout='900'  # 15 minutes without handshake before the session ends
+uci set ns-wgauth.config.lock_endpoint='roaming'  # the session follows a user who changes network
+uci set ns-wgauth.config.block_copies='1'         # block a peer whose configuration is used twice at once
 uci commit ns-wgauth
 reload_config
 ```
 
-Options: `port` (8181), `idle_timeout` (300 seconds, 0 disables it), `lock_endpoint` (1), `max_failures` (5),
-`lockout_time` (900 seconds).
+Options: `port` (8181), `idle_timeout` (300 seconds, 0 disables it), `lock_endpoint` (`1`, `roaming` or `0`),
+`detect_copies` (1), `block_copies` (0), `max_failures` (5 per public IP), `lockout_time` (900 seconds).
+
+## Update without rebuilding
+
+The login is Python and static files: after a fix to them, copy them instead of building a new image. From the
+repository folder, bash:
+
+```sh
+FW=root@192.168.1.1
+NETHSEC=$(ssh $FW "python3 -c 'import nethsec, os; print(os.path.dirname(nethsec.__file__))'")
+scp packages/python3-nethsec/src/nethsec/wgauth/__init__.py $FW:$NETHSEC/wgauth/__init__.py
+scp packages/ns-wgauth/files/ns-wgauth.py $FW:/usr/sbin/ns-wgauth
+scp packages/ns-wgauth/files/www/* $FW:/www-wgauth/
+scp packages/ns-api/files/ns.wireguard $FW:/usr/libexec/rpcd/ns.wireguard
+ssh $FW "/etc/init.d/ns-wgauth restart && ns-wgauth check"
+```
+
+Changes to the web UI still need the image, or the UI steps of [FORK-TESTING.md](FORK-TESTING.md).
 
 ## If something doesn't work
 
 Collect this and send it:
 
 ```sh
+ns-wgauth check
 grep ns-wgauth /var/log/messages | tail -50
 nft list table inet ns_wgauth
 ns-wgauth status
+ns-wgauth alerts
 wg show
 cat /etc/nginx/conf.d/ns-wgauth.conf
-nginx -t -c /etc/nginx/uci.conf
 uci show network | grep -E "ns_auth|ns_user|ns_type"
 ```
 
@@ -175,5 +220,5 @@ follow [FORK-TESTING.md](FORK-TESTING.md).
 
 - The new web UI strings are in English only.
 - Local users databases only, not LDAP.
-- Sessions are lost on reboot or HA failover: users log in again.
-- Two devices behind the same public IP can't be told apart by the IP lock.
+- Sessions are lost on reboot or HA failover: users log in again. Warnings and blocks stay.
+- Two devices behind the same public IP can't be told apart: neither the IP lock nor the copy detection see them.
