@@ -17,6 +17,66 @@ import re
 from datetime import datetime, timezone
 
 
+# The other addresses of a server, tried by the clients when the public endpoint doesn't answer: the configuration
+# of a peer lists them in a "# Fallback = host:port, ..." comment, read only by the clients that support it
+MAX_FALLBACK_ENDPOINTS = 4
+
+
+def __split_endpoint(text):
+    """
+    Split "host", "host:port", "[ipv6]" or "[ipv6]:port" into (host, port), port None when missing; a bare IPv6
+    address has no port. Return None if the host isn't an IP address or a domain name, or the port isn't valid.
+    """
+    port = None
+    if text.startswith('['):
+        host, _, rest = text[1:].partition(']')
+        if rest:
+            if not rest.startswith(':'):
+                return None
+            port = rest[1:]
+    elif text.count(':') == 1:
+        host, port = text.split(':')
+    else:
+        host = text
+    if port is not None:
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            return None
+        port = int(port)
+    try:
+        address = ipaddress.ip_address(host)
+        if text.startswith('[') and address.version != 6:
+            return None
+    except ValueError:
+        if text.startswith('[') or not re.match(r'^[a-zA-Z0-9.-]+$', host):
+            return None
+    return host, port
+
+
+def __format_endpoint(host, port):
+    """The Endpoint of a WireGuard configuration: IPv6 addresses go in brackets."""
+    try:
+        if ipaddress.ip_address(host).version == 6:
+            return f"[{host}]:{port}"
+    except ValueError:
+        pass
+    return f"{host}:{port}"
+
+
+def __fallback_endpoints(u, instance):
+    """The fallback endpoints of a server, as "host:port": without a port, the one of the server."""
+    port = u.get('network', instance, 'listen_port', dtype=int)
+    endpoints = []
+    for text in u.get('network', instance, 'ns_fallback_endpoints', dtype=str, list=True, default=[]):
+        parsed = __split_endpoint(text)
+        if parsed is not None:
+            endpoints.append(__format_endpoint(parsed[0], parsed[1] or port))
+    return endpoints
+
+
+def __clean_endpoints(endpoints):
+    return [endpoint.strip() for endpoint in endpoints if endpoint.strip() != '']
+
+
 def __next_instance():
     for i in range(1, 100):
         instance = f'wg{i}'
@@ -134,6 +194,8 @@ def get_instance_defaults():
         ret["public_endpoint"] = ""
     # tells the clients that the login with user credentials is supported
     ret["auth_modes"] = list(wgauth.AUTH_MODES)
+    # and the fallback endpoints
+    ret["max_fallback_endpoints"] = MAX_FALLBACK_ENDPOINTS
     return ret
 
 
@@ -175,6 +237,7 @@ def __list_peers(interface):
     server_network = u.get('network', interface, 'ns_network')
     server_endpoint = u.get('network', interface, 'ns_public_endpoint')
     server_port = u.get('network', interface, 'listen_port', dtype=int)
+    fallback_endpoints = __fallback_endpoints(u, interface)
 
     peers = []
     for p in utils.get_all_by_type(u, "network", f"wireguard_{interface}"):
@@ -190,7 +253,7 @@ def __list_peers(interface):
             "mtu": u.get('network', p, 'ns_mtu', dtype=int, default=0),
             "config": __generate_peer_config(
                 u, p, server_public_key, server_dns, server_name,
-                server_network, server_endpoint, server_port
+                server_network, server_endpoint, server_port, fallback_endpoints=fallback_endpoints
             ),
         }
         public_key = u.get('network', p, 'public_key', dtype=str, default='')
@@ -274,6 +337,23 @@ def __validate_tunnel_data(args):
     except ValueError:
         if not re.match(r'^[a-zA-Z0-9.-]+$', args['public_endpoint']):
             return utils.validation_error('public_endpoint', 'invalid_ip_address_or_fqdn', args['public_endpoint'])
+    if 'fallback_endpoints' in args:
+        endpoints = args['fallback_endpoints']
+        if not isinstance(endpoints, list) or not all(isinstance(endpoint, str) for endpoint in endpoints):
+            return utils.validation_error('fallback_endpoints', 'invalid', endpoints)
+        endpoints = __clean_endpoints(endpoints)
+        if len(endpoints) > MAX_FALLBACK_ENDPOINTS:
+            return utils.validation_error('fallback_endpoints', 'too_many_endpoints', endpoints)
+        # the public endpoint and each fallback only once, whatever the case of the name
+        seen = {__format_endpoint(args['public_endpoint'], args['listen_port']).lower()}
+        for endpoint in endpoints:
+            parsed = __split_endpoint(endpoint)
+            if parsed is None:
+                return utils.validation_error('fallback_endpoints', 'invalid_endpoint', endpoint)
+            key = __format_endpoint(parsed[0], parsed[1] or args['listen_port']).lower()
+            if key in seen:
+                return utils.validation_error('fallback_endpoints', 'duplicate_endpoint', endpoint)
+            seen.add(key)
     if 'mtu' in args:
         try:
             int(args['mtu'])
@@ -369,6 +449,9 @@ def add_server(args):
     filter_dns = list(filter(lambda x: x != '', args.get('dns', [])))
     e_uci.set('network', instance, 'ns_dns', filter_dns)
     e_uci.set('network', instance, 'ns_public_endpoint', args['public_endpoint'])
+    fallback_endpoints = __clean_endpoints(args.get('fallback_endpoints', []))
+    if fallback_endpoints:
+        e_uci.set('network', instance, 'ns_fallback_endpoints', fallback_endpoints)
     e_uci.set('network', instance, 'ns_name', args['name'])
     e_uci.set('network', instance, 'disabled', not args['enabled'])
     e_uci.set('network', instance, 'ns_type', 'server')
@@ -414,6 +497,13 @@ def edit_server(args):
     filter_dns = list(filter(lambda x: x != "", args.get("dns", [])))
     __set_list_to_uci(e_uci, 'network', args['instance'], 'ns_dns', filter_dns)
     e_uci.set('network', args['instance'], 'ns_public_endpoint', args['public_endpoint'])
+    # missing, the fallback endpoints stay: a client that doesn't know them must not remove them
+    if 'fallback_endpoints' in args:
+        fallback_endpoints = __clean_endpoints(args['fallback_endpoints'])
+        if fallback_endpoints:
+            __set_list_to_uci(e_uci, 'network', args['instance'], 'ns_fallback_endpoints', fallback_endpoints)
+        else:
+            e_uci.delete('network', args['instance'], 'ns_fallback_endpoints')
     e_uci.set('network', args['instance'], 'ns_name', args['name'])
     e_uci.set('network', args['instance'], 'disabled', not args['enabled'])
     __set_auth_options(e_uci, args['instance'], args)
@@ -634,7 +724,7 @@ def delete_peer(args):
     return {"result": "success"}
 
 
-def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_name, server_network, server_endpoint, server_port, login_url=None):
+def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_name, server_network, server_endpoint, server_port, login_url=None, fallback_endpoints=()):
     """Generate peer config reusing EUci instance and pre-computed server data."""
     config = "[Interface]\n"
     config += f"# Name = {u.get('network', peer_id, 'ns_name')}\n"
@@ -664,7 +754,10 @@ def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_nam
         addresses = list(u.get('network', peer_id, 'ns_local_routes', list=True, dtype=str, default=[]))
         addresses.append(server_network)
         config += f"AllowedIPs = {','.join(addresses)}\n"
-    config += f"Endpoint = {server_endpoint}:{server_port}\n"
+    config += f"Endpoint = {__format_endpoint(server_endpoint, server_port)}\n"
+    if fallback_endpoints:
+        # the other apps ignore comments: they use only Endpoint
+        config += f"# Fallback = {', '.join(fallback_endpoints)}\n"
     config += f"PersistentKeepalive = {u.get('network', peer_id, 'persistent_keepalive', default='25')}\n"
 
     return config
@@ -693,6 +786,7 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts):
     server_address = u.get('network', instance, 'addresses', dtype=str, list=True, default=None)[0]
     server_network = u.get('network', instance, 'ns_network')
     server_endpoint = u.get('network', instance, 'ns_public_endpoint')
+    fallback_endpoints = __fallback_endpoints(u, instance)
     server_enabled = not u.get('network', instance, 'disabled', dtype=bool, default=False)
     server_mtu = u.get('network', instance, 'mtu', dtype=int, default=0)
     server_dns = u.get('network', instance, 'ns_dns', dtype=str, list=True, default=[])
@@ -724,7 +818,7 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts):
             "mtu": u.get('network', p, 'ns_mtu', dtype=int, default=0),
             "config": __generate_peer_config(
                 u, p, server_public_key, server_dns, server_name,
-                server_network, server_endpoint, server_port, login_url
+                server_network, server_endpoint, server_port, login_url, fallback_endpoints
             ),
             "user": u.get('network', p, 'ns_user', default=''),
             "authenticated": gated and reserved_ip in server_sessions,
@@ -748,6 +842,8 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts):
         "address": server_address,
         "network": server_network,
         "public_endpoint": server_endpoint,
+        # as written by the administrator, without the default port
+        "fallback_endpoints": u.get('network', instance, 'ns_fallback_endpoints', dtype=str, list=True, default=[]),
         "enabled": server_enabled,
         "peers": peers,
         "mtu": server_mtu,
@@ -1076,6 +1172,7 @@ if cmd == 'list':
             "network": "10.0.0.0/24",
             "listen_port": 51820,
             "public_endpoint": "vpn.example.com",
+            "fallback_endpoints": ["vpn2.example.com", "203.0.113.10:51821"],
             "mtu": 1420,
             "dns": ["1.1.1.1"],
             "auth_mode": "key_password",
@@ -1089,6 +1186,7 @@ if cmd == 'list':
             "network": "10.0.0.0/24",
             "listen_port": 51820,
             "public_endpoint": "vpn.example.com",
+            "fallback_endpoints": ["vpn2.example.com", "203.0.113.10:51821"],
             "mtu": 1420,
             "dns": ["1.1.1.1"],
             "auth_mode": "key_password",
