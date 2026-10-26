@@ -173,7 +173,23 @@ while the laptop is on Wi-Fi. The detection needs the two devices active at the 
 
 **Fallback endpoints**: edit the server, add one under **Fallback endpoints** (e.g. the IP of a second line, or
 `host:port`), save and apply. The downloaded configuration has `# Fallback = ...` after `Endpoint`; the official
-WireGuard apps still connect with `Endpoint`. The VPN Client doesn't use the fallbacks yet.
+WireGuard apps still connect with `Endpoint`.
+
+The VPN Client uses them: when the server doesn't answer at an address for 20 seconds, it moves to the next one, the
+tunnel and the login stay. Import the new configuration (it replaces the old one), connect: **Details...** shows the
+fallbacks and *Address in use: ... (main)*.
+
+- Quick test, without touching the lines: in a copy of the `.conf`, set `Endpoint` to an address that doesn't answer
+  (e.g. `192.0.2.1:51820`) and put the real one in `# Fallback = ...`, import it under another name and connect. About
+  20 seconds later the tunnel comes up on the fallback and the login window works.
+- Real test: connect through line 1, then take line 1 away (unplug it, or turn off its port forward on the router).
+  Within about 20 seconds of traffic (open a page) the client moves to line 2, *Address in use* says *(fallback 1)*,
+  and the session stays: no new login, as long as the line is down for less than 5 minutes (`idle_timeout`).
+  When line 1 comes back the client stays on line 2 until that one fails; the next **Connect** starts with line 1.
+
+The service log, `C:\Program Files\VPN Client\log\service.log` (menu **Logs**), has
+`no answer from <address> for 20 seconds, now <fallback>`, then `<fallback> answers`. The router must forward the
+port on both lines, and send the answers back out the line they came in on.
 
 **Connections**: the new **Connections** tab of the WireGuard page. Connect a peer and wait a minute: a row appears,
 **Connected**, with the public IP of the client and the bytes. Disconnect: about 3 minutes later the row gets its end.
