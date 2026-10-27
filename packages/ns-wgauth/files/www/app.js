@@ -10,7 +10,8 @@ const sections = ['loading', 'unavailable', 'refused', 'login', 'session']
 const REFUSED = {
   blocked:
     'This VPN configuration is blocked: it seems to be used on more than one device at the same time. Contact your administrator.',
-  no_user: 'This VPN configuration is not linked to a user yet. Contact your administrator.'
+  no_user: 'This VPN configuration is not linked to a user yet. Contact your administrator.',
+  no_otp: 'The one-time codes of your user are not set up. Contact your administrator for a new QR code.'
 }
 const element = (id) => document.getElementById(id)
 let refreshTimer
@@ -75,8 +76,8 @@ async function refresh() {
     element('user').textContent = status.user
     element('expires').textContent = describeExpiry(status.expires)
     show('session')
-  } else if (status.blocked || status.no_user) {
-    showRefused(status.blocked ? 'blocked' : 'no_user')
+  } else if (status.blocked || status.no_user || status.no_otp) {
+    showRefused(status.blocked ? 'blocked' : status.no_user ? 'no_user' : 'no_otp')
   } else {
     element('otp-field').hidden = !status.otp_required
     element('otp').required = Boolean(status.otp_required)

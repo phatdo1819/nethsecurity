@@ -117,6 +117,9 @@ No new options. With `key_password_otp` the OTP secret is the user's `openvpn_2f
 OpenVPN Road Warrior: a user already enrolled for OpenVPN uses the same authenticator entry.
 If the user has no secret yet, `ns.wireguard` creates it when the user is linked to a peer of a server that requires
 OTP, or when a server starts requiring it.
+The secret can disappear later, for example with the removal of the user's OpenVPN account, which deletes
+`openvpn_2fa`: the login then refuses the peer (`no_otp`) instead of checking codes against an empty secret, which
+`pyotp` accepts and anyone can compute. Saving the peer again creates a new secret, to send as a new QR code.
 
 ### Login service
 
@@ -306,8 +309,8 @@ nginx serves it at `http://<server address>:<port>/api/` and proxies it to the d
 client address) and `X-Forwarded-Host` (the requested host).
 
 - `GET /api/status`: `{"authenticated": false, "otp_required": true, "server": "Road warriors", "blocked": false,
-  "no_user": false}`; with a session also `"user"` and `"expires"`. `blocked` and `no_user` let the page explain why
-  the user can't log in
+  "no_user": false, "no_otp": false}`; with a session also `"user"` and `"expires"`. `blocked`, `no_user` and
+  `no_otp` (OTP required but the user has no secret) let the page explain why the user can't log in
 - `POST /api/login` with `{"username": "alice", "password": "...", "otp": "123456"}`:
   `{"result": "success", "user": "alice", "expires": "2026-10-24T18:00:00+00:00"}`
 - `POST /api/logout` with `{}`: `{"result": "success"}`
@@ -319,7 +322,8 @@ site can't send it without a CORS preflight, which the API never answers.
 
 The login checks:
 
-1. the peer isn't blocked (`403 {"error": "blocked"}`) and has a user (`403 {"error": "no_user"}`)
+1. the peer isn't blocked (`403 {"error": "blocked"}`), has a user (`403 {"error": "no_user"}`) and, with
+   `key_password_otp`, the user has an OTP secret (`403 {"error": "no_otp"}`)
 2. the public IP of the client isn't locked out: after `max_failures` failures from that IP it gets
    `429 {"error": "too_many_attempts"}` for `lockout_time` seconds. The failures are counted per public IP
    (`wg show all endpoints`), not per peer: someone trying passwords with a copied configuration from another network

@@ -17,7 +17,9 @@ The login is enabled per server, in the network interface of a WireGuard server 
 - `ns_auth_timeout`: session length in seconds, default `28800` (8 hours), from 300 to 604800
 
 Each peer of such a server is linked to a user with the `ns_user` option. With `key_password_otp` the OTP secret is
-the `openvpn_2fa` option of the user, the one used by OpenVPN Road Warrior.
+the `openvpn_2fa` option of the user, the one used by OpenVPN Road Warrior. Removing the user's OpenVPN account
+deletes it: the user can't log in until the peer is saved again, which creates a new secret (`ns-wgauth check`
+reports it).
 
 Use the `ns.wireguard` API to change these options, see `packages/ns-api/README.md`.
 
@@ -61,6 +63,10 @@ The login page is `http://<server address>:<port>/`, for example `http://10.103.
 configurations contain it as a `# Login = ...` comment. With `redirect`, any plain `http://` address opened before
 the login leads there too, `http://neverssl.com` for example. The page has an icon for the home screen of a phone,
 and its form is marked for password managers, so the browser can remember the username and password.
+
+The page is plain HTTP: `https://` addresses don't work on the login port. The password still travels encrypted,
+inside the WireGuard tunnel, and the port is reachable only from the tunnel. Browsers may mark the password field as
+not secure.
 
 ## How it works
 
@@ -114,14 +120,14 @@ its address in the VPN, and the page must be opened with the address of the serv
 `login` and `logout` accept only JSON requests.
 
 - `GET /api/status`: `{"authenticated": false, "otp_required": true, "server": "Road warriors", "blocked": false,
-  "no_user": false}`, with a session also `"user": "alice"` and `"expires": "..."`
+  "no_user": false, "no_otp": false}`, with a session also `"user": "alice"` and `"expires": "..."`
 - `POST /api/login` with `{"username": "alice", "password": "...", "otp": "123456"}`:
   `{"result": "success", "user": "alice", "expires": "2026-10-24T18:00:00+00:00"}`
 - `POST /api/logout` with `{}`: `{"result": "success"}`
 
 Errors: `403 {"error": "forbidden"}` (not a peer of a server that requires the login),
 `403 {"error": "blocked"}` (suspected copy, see `block_copies`), `403 {"error": "no_user"}` (no user linked to the
-peer), `401 {"error": "invalid_credentials"}`, `429 {"error": "too_many_attempts", "retry_after": 840}`,
+peer), `403 {"error": "no_otp"}` (OTP required, the user has no secret), `401 {"error": "invalid_credentials"}`, `429 {"error": "too_many_attempts", "retry_after": 840}`,
 `400 {"error": "invalid_request"}`, `500 {"error": "internal_error"}`.
 
 ## Limitations

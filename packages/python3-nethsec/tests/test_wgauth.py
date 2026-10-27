@@ -347,6 +347,16 @@ def test_check_login_otp(tmp_path):
     assert not wgauth.check_login(state, "wg1", alice, "alice", PASSWORD, "12345")
     assert wgauth.check_login(state, "wg1", alice, "alice", PASSWORD, code)
     assert not wgauth.check_login(state, "wg1", alice, "alice", "wrong", code)
+    assert not wgauth.otp_missing(state, "wg1", alice)
+    # the secret is removed with the OpenVPN account: pyotp would accept the codes of an empty secret
+    u.delete("users", "ns_wgalice", "openvpn_2fa")
+    alice = wgauth.build_state(u)["servers"]["wg1"]["peers"]["10.103.1.2"]
+    assert alice["otp_secret"] == ""
+    assert wgauth.otp_missing(state, "wg1", alice)
+    empty_code = pyotp.TOTP("").now()
+    assert not wgauth.verify_otp("", empty_code)
+    assert not wgauth.verify_otp(None, empty_code)
+    assert not wgauth.check_login(state, "wg1", alice, "alice", PASSWORD, empty_code)
 
 
 def test_saved_changes_wait_for_apply(tmp_path):

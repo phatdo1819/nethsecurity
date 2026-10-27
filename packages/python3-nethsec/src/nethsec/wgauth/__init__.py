@@ -484,6 +484,9 @@ def verify_otp(secret, code):
 
     if not isinstance(code, str) or not code.isdigit() or len(code) != 6:
         return False
+    if not isinstance(secret, str) or not secret:
+        # pyotp accepts an empty secret: its codes are the same for everyone
+        return False
     try:
         return pyotp.TOTP(secret).verify(code, valid_window=1)
     except (TypeError, ValueError):
@@ -519,6 +522,23 @@ def check_login(state, server, peer, username, password, otp=""):
         # malformed password hash
         return False
     return not state["servers"][server]["otp"] or verify_otp(peer.get("otp_secret", ""), otp)
+
+
+def otp_missing(state, server, peer):
+    """
+    Tell if the server requires an OTP code and the user linked to the peer has no OTP secret, for example after
+    the removal of its OpenVPN account: nobody can log in until an administrator saves the peer again, which
+    creates a new secret.
+
+    Arguments:
+      - state -- see `build_state`
+      - server -- WireGuard server interface name
+      - peer -- the peer entry returned by `find_peer`
+
+    Returns:
+      - True if the OTP secret is missing
+    """
+    return bool(state["servers"][server]["otp"] and peer.get("user") and not peer.get("otp_secret"))
 
 
 def ensure_otp_secret(uci, user):
