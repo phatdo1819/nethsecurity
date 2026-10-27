@@ -235,6 +235,7 @@ class LoginService:
             "server": config["name"],
             "blocked": wgauth.is_blocked(peer),
             "no_user": not peer["user"],
+            "no_otp": wgauth.otp_missing(state, server, peer),
         }
         left = wgauth.list_sessions().get(server, {}).get(address)
         if left is not None:
@@ -265,6 +266,8 @@ class LoginService:
             return 403, {"error": "blocked"}
         if not peer["user"]:
             return 403, {"error": "no_user"}
+        if wgauth.otp_missing(state, server, peer):
+            return 403, {"error": "no_otp"}
         now = time.time()
         # the public IP of the client: the request just came through the tunnel
         endpoint = (wgauth.read_endpoints() or {}).get(peer["public_key"], "")
@@ -558,6 +561,12 @@ def check():
         for peer in state["servers"][server]["peers"].values():
             if not peer["user"]:
                 report("WARNING", f"peer {peer['peer']} of {server} has no user: it can't log in")
+            elif wgauth.otp_missing(state, server, peer):
+                report(
+                    "WARNING",
+                    f"user {peer['user']} of peer {peer['peer']} of {server} has no OTP secret: it can't log in, "
+                    "save the peer again to create one and send the user the new QR code",
+                )
             if endpoints.get(peer["public_key"]):
                 by_address.setdefault(endpoints[peer["public_key"]], []).append(peer["peer"])
         for address, peers in sorted(by_address.items()):
