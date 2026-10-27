@@ -175,9 +175,10 @@ while the laptop is on Wi-Fi. The detection needs the two devices active at the 
 `host:port`), save and apply. The downloaded configuration has `# Fallback = ...` after `Endpoint`; the official
 WireGuard apps still connect with `Endpoint`.
 
-The VPN Client uses them: when the server doesn't answer at an address for 20 seconds, it moves to the next one, the
-tunnel and the login stay. Import the new configuration (it replaces the old one), connect: **Details...** shows the
-fallbacks and *Address in use: ... (main)*.
+[Authway](https://github.com/phatdo1819/authway), the WireGuard client for Windows with the login, uses them (install
+it from the MSI package of its repo): when the server doesn't answer at an address for 20 seconds, it moves to the
+next one, the tunnel and the login stay. Import the new configuration (it replaces the old one), connect:
+**Details...** shows the fallbacks and *Address in use: ... (main)*.
 
 - Quick test, without touching the lines: in a copy of the `.conf`, set `Endpoint` to an address that doesn't answer
   (e.g. `192.0.2.1:51820`) and put the real one in `# Fallback = ...`, import it under another name and connect. About
@@ -187,7 +188,7 @@ fallbacks and *Address in use: ... (main)*.
   and the session stays: no new login, as long as the line is down for less than 5 minutes (`idle_timeout`).
   When line 1 comes back the client stays on line 2 until that one fails; the next **Connect** starts with line 1.
 
-The service log, `C:\Program Files\VPN Client\log\service.log` (menu **Logs**), has
+The service log, `C:\Program Files\Authway\log\service.log` (menu **Logs**), has
 `no answer from <address> for 20 seconds, now <fallback>`, then `<fallback> answers`. The router must forward the
 port on both lines, and send the answers back out the line they came in on.
 
