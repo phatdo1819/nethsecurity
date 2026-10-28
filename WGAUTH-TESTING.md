@@ -3,7 +3,9 @@
 This branch, `ci-wgauth`, builds a NethSecurity image with the WireGuard login: the peers of a WireGuard server
 must log in on a web page with a username, a password and an OTP code before they can use the VPN.
 A copied peer configuration alone gives no access, and a copy used at the same time as the real device is detected.
-How it works: [design document](docs/design/wireguard_user_auth.md) and [ns-wgauth](packages/ns-wgauth/README.md).
+With device binding (step 9), a server also accepts the login only from the device enrolled for the peer.
+How it works: [design document](docs/design/wireguard_user_auth.md),
+[device binding](docs/design/wireguard_device_binding.md) and [ns-wgauth](packages/ns-wgauth/README.md).
 
 The image also contains everything of `ci-fork`: the Road Warrior multi-server changes and OpenVPN with DCO.
 It's built from the development branch of NethSecurity, newer than 8.8.0: install it only on a test firewall.
@@ -204,6 +206,103 @@ api-cli ns.wireguard connection-history
 
 The history is in `/var/wireguard/connections.db` (lost at reboot), or on the data storage if there is one.
 
+## 9. Test device binding
+
+A server with **Device binding** accepts the login only from the device enrolled for each peer: the VPN app signs
+every login with a key that never leaves the computer, and the first login enrolls it. A copy of the configuration,
+even with the password and the OTP code, then fails on another computer. With **Machine ID** the app also sends a
+hash of the hardware ID of the computer. Only [Authway](https://github.com/phatdo1819/authway) can log in on such a
+server: the browser and the official WireGuard apps can't sign.
+
+### Install it on the firewall without rebuilding
+
+An image built from `ci-wgauth` before device binding can get it by copying files: the firewall side is Python and
+static files, `openssl` is already in the image. A new image built after these changes already has it: skip to
+[Set it up](#set-it-up).
+
+From the folder of the repository with the changes, in Git Bash on Windows or bash elsewhere (on the Windows PC of
+the development, the changes are in `C:\Users\phatdo\nethsecurity-feat` until they are committed):
+
+```sh
+FW=root@192.168.1.1     # your firewall
+NETHSEC=$(ssh $FW "python3 -c 'import nethsec, os; print(os.path.dirname(nethsec.__file__))'")
+
+# 1. back up the current files, once
+ssh $FW "mkdir -p /root/device-binding-backup && cp $NETHSEC/wgauth/__init__.py /root/device-binding-backup/wgauth.py && cp /usr/sbin/ns-wgauth /usr/libexec/rpcd/ns.wireguard /root/device-binding-backup/ && cp -a /www-wgauth /www-ns /root/device-binding-backup/"
+
+# 2. the firewall files
+scp packages/python3-nethsec/src/nethsec/wgauth/__init__.py $FW:$NETHSEC/wgauth/__init__.py
+scp packages/ns-wgauth/files/ns-wgauth.py $FW:/usr/sbin/ns-wgauth
+scp packages/ns-wgauth/files/www/* $FW:/www-wgauth/
+scp packages/ns-api/files/ns.wireguard $FW:/usr/libexec/rpcd/ns.wireguard
+# a clone on Windows has Windows line endings: they break the scripts
+ssh $FW "sed -i 's/\r$//' /usr/sbin/ns-wgauth /usr/libexec/rpcd/ns.wireguard /www-wgauth/app.js"
+```
+
+The web UI comes from the `ci-wgauth` branch of nethsecurity-ui, with the device binding changes: build it with
+`npm ci` and `npm run build-only` (the result is in `dist`; on the Windows PC of the development it's already built in
+`C:\Users\phatdo\nethsecurity-ui\dist`). A build of another branch would lose the Road Warrior changes of the image.
+Copy it, keeping the branding of the firewall:
+
+```sh
+UI=../nethsecurity-ui/dist      # the folder of the UI build
+ssh $FW "rm -rf /tmp/ui && mkdir /tmp/ui"
+scp -r $UI/* $FW:/tmp/ui/
+ssh $FW "rm -f /tmp/ui/branding.js && cp -a /tmp/ui/. /www-ns/ && rm -rf /tmp/ui"
+
+# 3. restart: rpcd learns the new API methods, ns-wgauth takes the new configuration
+ssh $FW "which openssl && /etc/init.d/rpcd restart && /etc/init.d/ns-wgauth restart && ns-wgauth check"
+```
+
+Reload the web UI with Ctrl+F5. To undo, copy the files of `/root/device-binding-backup/` back to the same places
+(`wgauth.py` to `$NETHSEC/wgauth/__init__.py`), then restart `rpcd` and `ns-wgauth`.
+
+### The client
+
+Authway signs the login from the version with device binding: build its package from its repository
+([Build](https://github.com/phatdo1819/authway#build): `tools\fetch-wireguard.ps1`, then `tools\dist.ps1` on Windows;
+`tools/fetch-wireguard-go.sh`, then `tools/dist-macos.sh` on a Mac) and install it over the old one: the VPNs stay.
+An older Authway gets **device required** on a bound server.
+
+### Set it up
+
+1. Edit the server of step 5: in the login section turn on **Device binding**. Leave **Machine ID** off for the
+   first tests. Save and apply.
+2. The server card shows **Device binding: On** and the peer table a **Device** column: every peer shows
+   *Waiting for the first login*, for 72 hours (`enroll_window`).
+3. On the firewall, `ns-wgauth check` prints `OK  wg1 requires device binding`, and `ns-wgauth devices` the open
+   enrollments.
+
+### Tests
+
+| Test | Expected |
+|---|---|
+| Open the login page in a browser | It says that only the VPN app on the enrolled device can log in; no form |
+| Authway: connect and log in | The window says the first login enrolls this computer. After the login the peer shows the name of the computer in **Device**; its tooltip shows when, from which IP, and the key `software` |
+| Disconnect, connect and log in again from the same computer | It works, without a new enrollment |
+| Import the same `.conf` in Authway on another computer, log in with the right password and code | **This VPN configuration is enrolled on another device**. The peer shows a warning, "login attempt from another device", once an hour at most. The password isn't even checked: 5 tries lock out that IP |
+| Peer menu > **Revoke device** | The session ends at once. Authway shows *no device enrolled*; the peer shows **No device**, and `ns-wgauth check` warns |
+| Peer menu > **Allow a new device**, then log in from the second computer | The second computer is enrolled; the first one is refused |
+| Remove the VPN from Authway, add it again, log in | Refused: removing a VPN deletes its key. Allow a new device first |
+| Peer menu > **Generate new keys**, apply, import the new `.conf` | The peer waits for the first login again, for 72 hours |
+| Turn **Machine ID** on, apply, log in | It works; the tooltip says the machine ID is recorded (the first login after turning it on records it) |
+| Turn **Device binding** off, apply | The browser and the WireGuard apps can log in again. On again: the devices enrolled before work at once |
+
+On the firewall:
+
+```sh
+ns-wgauth devices                       # enrolled devices, open enrollments
+ns-wgauth alerts                        # the device_mismatch warnings
+grep ns-wgauth /var/log/messages | grep -i device
+ls -l /etc/ns-wgauth/devices.json       # root only: -rw-------
+```
+
+The log has `device enrolled: peer=... name=... from=...` for every enrollment: check it's the computer you expect.
+
+In Authway, the service log (`C:\Program Files\Authway\log\service.log`, menu **Logs**) has `new device key` at the
+first signed login. The key is kept by Windows (a key of the computer, `Authway device {GUID}`), and can't be
+exported.
+
 ## Settings
 
 `/etc/config/ns-wgauth`, changed with `uci`. The changes take effect when applied:
@@ -218,7 +317,8 @@ reload_config
 
 Options: `port` (8181), `redirect` (1), `idle_timeout` (300 seconds, 0 disables it), `lock_endpoint` (`1`,
 `roaming` or `0`), `detect_copies` (1), `block_copies` (0), `max_failures` (5 per public IP), `lockout_time`
-(900 seconds). If the redirect causes any trouble, `uci set ns-wgauth.config.redirect='0'` turns it off.
+(900 seconds), `enroll_window` (259200 seconds, 72 hours, for device binding). If the redirect causes any trouble,
+`uci set ns-wgauth.config.redirect='0'` turns it off.
 
 ## Update without rebuilding
 
@@ -233,10 +333,14 @@ scp packages/ns-wgauth/files/ns-wgauth.py $FW:/usr/sbin/ns-wgauth
 scp packages/ns-wgauth/files/www/* $FW:/www-wgauth/
 scp packages/ns-wgauth/files/config $FW:/tmp/ns-wgauth.default   # new options: compare with /etc/config/ns-wgauth
 scp packages/ns-api/files/ns.wireguard $FW:/usr/libexec/rpcd/ns.wireguard
-ssh $FW "/etc/init.d/ns-wgauth restart && ns-wgauth check"
+# only from a clone on Windows: remove the Windows line endings
+ssh $FW "sed -i 's/\r$//' /usr/sbin/ns-wgauth /usr/libexec/rpcd/ns.wireguard /www-wgauth/*.js"
+# rpcd learns the API methods added by the change
+ssh $FW "/etc/init.d/rpcd restart && /etc/init.d/ns-wgauth restart && ns-wgauth check"
 ```
 
-Changes to the web UI still need the image, or the UI steps of [FORK-TESTING.md](FORK-TESTING.md).
+Changes to the web UI need the image, or a build of the `ci-wgauth` branch of nethsecurity-ui copied as in
+[step 9](#install-it-on-the-firewall-without-rebuilding).
 
 ## If something doesn't work
 
@@ -248,9 +352,10 @@ grep ns-wgauth /var/log/messages | tail -50
 nft list table inet ns_wgauth
 ns-wgauth status
 ns-wgauth alerts
+ns-wgauth devices
 wg show
 cat /etc/nginx/conf.d/ns-wgauth.conf
-uci show network | grep -E "ns_auth|ns_user|ns_type"
+uci show network | grep -E "ns_auth|ns_user|ns_type|ns_device|ns_machine"
 ```
 
 `wg show` doesn't print private keys, and the `uci` line keeps only the login options.
@@ -272,3 +377,6 @@ follow [FORK-TESTING.md](FORK-TESTING.md).
 - The standard WireGuard apps can't open the login page by themselves: bookmark, home-screen icon or redirect.
 - Firefox may keep for a minute the names opened just before the login: reload the page if a site doesn't open
   right after logging in.
+- Device binding works only with Authway (Windows and macOS): no phones, no Linux, no browser on a bound server.
+  Its key is a software key: an administrator of the enrolled computer could copy it. It controls the login only:
+  a copy behind the same public IP as the logged-in owner still shares the session.
