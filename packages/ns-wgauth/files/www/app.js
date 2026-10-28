@@ -11,7 +11,9 @@ const REFUSED = {
   blocked:
     'This VPN configuration is blocked: it seems to be used on more than one device at the same time. Contact your administrator.',
   no_user: 'This VPN configuration is not linked to a user yet. Contact your administrator.',
-  no_otp: 'The one-time codes of your user are not set up. Contact your administrator for a new QR code.'
+  no_otp: 'The one-time codes of your user are not set up. Contact your administrator for a new QR code.',
+  device_required:
+    'This VPN accepts logins only from the VPN app given by your administrator, on your enrolled device: a web browser can’t log in.'
 }
 const element = (id) => document.getElementById(id)
 let refreshTimer
@@ -78,6 +80,8 @@ async function refresh() {
     show('session')
   } else if (status.blocked || status.no_user || status.no_otp) {
     showRefused(status.blocked ? 'blocked' : status.no_user ? 'no_user' : 'no_otp')
+  } else if (status.device && status.device.required) {
+    showRefused('device_required')
   } else {
     element('otp-field').hidden = !status.otp_required
     element('otp').required = Boolean(status.otp_required)

@@ -8650,13 +8650,15 @@ Response example:
   "network": "10.245.149.0/24",
   "public_endpoint": "79.19.71.172",
   "auth_modes": ["key", "key_password", "key_password_otp"],
-  "max_fallback_endpoints": 4
+  "max_fallback_endpoints": 4,
+  "device_binding": true
 }
 ```
 
 `auth_modes` lists the values accepted by the `auth_mode` parameter of `add-server`: a client can show the login
 options only when it's present. `max_fallback_endpoints` is the most `fallback_endpoints` a server can have: a client
-can show them only when it's present.
+can show them only when it's present. Likewise `device_binding` tells that the `device_binding` and `machine_id`
+parameters are supported.
 
 ### list-servers
 
@@ -8709,6 +8711,8 @@ Response example:
       "auth_mode": "key_password",
       "user_db": "main",
       "auth_timeout": 28800,
+      "device_binding": false,
+      "machine_id": false,
       "login_url": "http://10.1.122.1:8181/",
       "auth_enforced": true,
       "auth_blocked": false
@@ -8733,8 +8737,18 @@ Login fields of a peer:
 - `auth_expires`: when the session ends, only if `authenticated` is `true`
 - `blocked`: `true` if the peer is blocked after a suspected copy of its configuration (`block_copies` in
   `/etc/config/ns-wgauth`): it can't log in until its alerts are cleared or it gets new keys
-- `alerts`: suspected copies of the configuration (`type` `copy`, the public IPs it was used from at the same time)
-  and lockouts after too many failed logins (`type` `lockout`, the public IPs locked out), newest first
+- `alerts`: suspected copies of the configuration (`type` `copy`, the public IPs it was used from at the same time),
+  lockouts after too many failed logins (`type` `lockout`, the public IPs locked out) and logins from another device
+  (`type` `device_mismatch`, the public IP of the attempt), newest first
+- `device`: only on a server with `device_binding`. `state` is `enrolled`, `waiting` (a device can enroll until
+  `enrollment_until`) or `closed` (none can: see `allow-device-enrollment`). Once enrolled also `name` (the name the
+  device gave), `kind` (`software`: where the device keeps its key), `machine_id` (`true` if its machine ID is
+  recorded), `enrolled`, `last_used` and `from` (the public IP of its latest login), for example:
+  `{"state": "enrolled", "name": "LAPTOP-42", "kind": "software", "machine_id": false, "enrolled": "2025-09-29T08:00:00+00:00", "last_used": "2025-09-30T08:52:29+00:00", "from": "203.0.113.7"}`
+
+Device fields of a server:
+- `device_binding`: `true` if the peers must log in from their enrolled device
+- `machine_id`: `true` if the device must also send the ID of its machine
 
 
 ### add-server
@@ -8761,6 +8775,10 @@ Parameters:
   username and password of `user_db`, `key_password_otp` to require also an OTP code
 - `user_db` (required unless `auth_mode` is `key`): a local users database
 - `auth_timeout` (optional): session length in seconds, from 300 to 604800, default 28800
+- `device_binding` (optional): `true` to let the peers log in only from the device enrolled for them, with a VPN
+  client that signs the login; the browser and the official WireGuard apps can't. Requires `auth_mode` other than
+  `key`. See [device binding](../../docs/design/wireguard_device_binding.md)
+- `machine_id` (optional): `true` to also require the hardware ID of the enrolled machine. Requires `device_binding`
 
 Example of a server that requires the login:
 ```
@@ -8774,6 +8792,8 @@ Validation errors of the login parameters:
 - `auth_mode`: `invalid`; `peers_with_remote_networks` on `edit-server` if a peer has remote networks
 - `user_db`: `required`, `db_not_found`, `db_not_local`
 - `auth_timeout`: `invalid`
+- `device_binding`: `invalid`, `login_required`
+- `machine_id`: `invalid`, `device_binding_required`
 
 With `key_password_otp`, the users linked to the peers get an OTP secret if they don't have one yet, see
 `download-peer-2fa`.
@@ -8789,8 +8809,9 @@ Parameters:
 - `instance`: the name of the WireGuard instance, the instance must exist
 
 All other parameters are the same as in `add-server`. If `auth_mode` is missing, the login options keep their current
-values; `auth_mode` `key` removes the users database of the server. If `fallback_endpoints` is missing, the fallback
-endpoints stay as they are; an empty list removes them.
+values; `auth_mode` `key` removes the users database and the device binding of the server. Missing `device_binding`
+and `machine_id` keep their values too; `device_binding` `false` also turns `machine_id` off. If `fallback_endpoints`
+is missing, the fallback endpoints stay as they are; an empty list removes them.
 
 ### delete-server
 
@@ -8925,6 +8946,41 @@ Response example:
 ```
 
 Errors: validation error `id` `required` or `invalid`, error `clear_alerts_failed`.
+
+### allow-device-enrollment
+
+On a server with `device_binding`, forget the device of a peer and let a new one enroll at its next login, for
+example after a reinstall or on a new machine. It changes no configuration, no commit is needed:
+```
+api-cli ns.wireguard allow-device-enrollment --data '{"id": "wg1_ns_76e103f5_peer", "hours": 72}'
+```
+
+Parameters:
+- `id`: the peer
+- `hours` (optional): how long the enrollment stays open, from 1 to 720, default 72
+
+Response example:
+```json
+{"result": "success", "enrollment_until": "2025-10-03T08:52:29+00:00"}
+```
+
+Errors: validation error `id` `required`, `invalid` or `device_binding_not_required`, `hours` `invalid`, error
+`device_enrollment_failed`.
+
+### revoke-device
+
+On a server with `device_binding`, forget the device of a peer and end its session: the peer can't log in until a
+new enrollment is allowed. It changes no configuration, no commit is needed:
+```
+api-cli ns.wireguard revoke-device --data '{"id": "wg1_ns_76e103f5_peer"}'
+```
+
+Response example:
+```json
+{"result": "success"}
+```
+
+Errors: validation error `id` `required`, `invalid` or `device_binding_not_required`, error `device_revoke_failed`.
 
 
 ### list-tunnels

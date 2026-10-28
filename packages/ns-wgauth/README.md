@@ -21,6 +21,13 @@ the `openvpn_2fa` option of the user, the one used by OpenVPN Road Warrior. Remo
 deletes it: the user can't log in until the peer is saved again, which creates a new secret (`ns-wgauth check`
 reports it).
 
+A server that requires the login can also require device binding: its peers log in only from the device enrolled
+for them, with a VPN client that signs the login, see the [device binding design](../../design/wireguard_device_binding).
+The browser and the official WireGuard apps can't log in on such a server.
+
+- `ns_device_binding`: `1` to require it. Only with a login: switching `ns_auth_mode` to `key` removes it
+- `ns_machine_id`: `1` to also require the hardware ID of the enrolled machine
+
 Use the `ns.wireguard` API to change these options, see `packages/ns-api/README.md`.
 
 The login service is configured in `/etc/config/ns-wgauth`:
@@ -55,6 +62,8 @@ config main 'config'
 - `block_copies`: `1` to also block such a peer until an administrator clears its alerts or generates new keys
 - `max_failures`: failed logins from one public IP before it's locked out
 - `lockout_time`: seconds a public IP stays locked out
+- `enroll_window`: seconds a peer of a server with device binding can enroll its device, from its creation, its new
+  keys, or the binding of its server, default `259200` (72 hours)
 
 The changes take effect when they are applied (`uci commit ns-wgauth; reload_config`, or the Apply button of the
 UI): the daemon works on the configuration taken by `ns-wgauth sync`, not on the changes saved but not applied yet.
@@ -84,8 +93,11 @@ not secure.
   public IP (`lock_endpoint`), when its configuration seems used by two devices (`detect_copies`), and when a change
   to the peer (new keys too), the user (for example a new password) or the server is applied. Ending a session also
   deletes the conntrack entries of the peer, so its open connections stop.
-- Suspected copies and lockouts are recorded as alerts of the peer in `/etc/ns-wgauth/alerts.json`, kept across
-  reboots and upgrades. They belong to the keys of the peer: generating new keys drops them.
+- Suspected copies, lockouts and logins from another device are recorded as alerts of the peer in
+  `/etc/ns-wgauth/alerts.json`, kept across reboots and upgrades. They belong to the keys of the peer: generating new
+  keys drops them.
+- With device binding, the enrolled devices and the open enrollments are in `/etc/ns-wgauth/devices.json`, kept the
+  same way and tied to the keys of the peer too. The signatures are checked with `openssl`.
 - The init script runs before the network, so the gate exists before the WireGuard interfaces come up. procd runs it
   again when the `network`, `users` or `ns-wgauth` configuration changes. The daemon runs only while a server
   requires the login, and checks the table and the sessions every 15 seconds: if the table is missing, it builds
@@ -106,6 +118,7 @@ ns-wgauth status          # open sessions, as JSON
 ns-wgauth logout <peer>   # end the session of a peer, e.g. wg1_ns_1234abcd_peer
 ns-wgauth alerts          # suspected copies and lockouts, as JSON
 ns-wgauth clear <peer>    # forget the alerts of a peer and unblock it
+ns-wgauth devices         # enrolled devices and open enrollments, as JSON
 ns-wgauth sync            # apply the configuration now
 nft list table inet ns_wgauth
 ```
@@ -129,6 +142,12 @@ Errors: `403 {"error": "forbidden"}` (not a peer of a server that requires the l
 `403 {"error": "blocked"}` (suspected copy, see `block_copies`), `403 {"error": "no_user"}` (no user linked to the
 peer), `403 {"error": "no_otp"}` (OTP required, the user has no secret), `401 {"error": "invalid_credentials"}`, `429 {"error": "too_many_attempts", "retry_after": 840}`,
 `400 {"error": "invalid_request"}`, `500 {"error": "internal_error"}`.
+
+With device binding, the status also returns `"device": {"required": true, "enrolled": true, "enrollment_open": false,
+"machine_id": false, "challenge": "..."}`, and the login needs a `device` object signed by the device, see the
+[login protocol](../../design/wireguard_device_binding#login-protocol). More errors:
+`403 {"error": "device_required"}`, `403 {"error": "device_not_enrolled"}`, `401 {"error": "device_mismatch"}` and
+`401 {"error": "challenge_expired"}`.
 
 ## Limitations
 

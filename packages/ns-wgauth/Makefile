@@ -20,7 +20,7 @@ define Package/ns-wgauth
 	CATEGORY:=NethSecurity
 	TITLE:=Login with user credentials for WireGuard servers
 	URL:=https://github.com/NethServer/nethsecurity/
-	DEPENDS:=+python3-nethsec +python3-pyotp +nginx-ssl +nftables-json +conntrack +wireguard-tools +qrencode
+	DEPENDS:=+python3-nethsec +python3-pyotp +nginx-ssl +nftables-json +conntrack +wireguard-tools +qrencode +openssl-util
 	PKGARCH:=all
 endef
 

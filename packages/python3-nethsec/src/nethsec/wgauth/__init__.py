@@ -16,17 +16,24 @@ adds and removes them.
 The daemon works on a snapshot of the configuration, see `build_state`, taken when the configuration is applied:
 changes saved but not applied yet don't reach it.
 
-See docs/design/wireguard_user_auth.md.
+A gated server can also require device binding: a peer logs in only from the device enrolled for it, which signs
+every login with a key that never leaves it, see `verify_device`.
+
+See docs/design/wireguard_user_auth.md and docs/design/wireguard_device_binding.md.
 """
 
+import base64
+import binascii
 import contextlib
 import hashlib
+import hmac
 import ipaddress
 import json
 import os
 import struct
 import subprocess
 import syslog
+import tempfile
 import threading
 import time
 
@@ -42,7 +49,7 @@ DNS_TTL = 1
 # redirected DNS queries per second and per server, the others are rejected
 DNS_RATE = 100
 # bumped when the snapshot written by save_state changes: an older one is taken again
-STATE_VERSION = 2
+STATE_VERSION = 3
 DEFAULT_TIMEOUT = 28800
 MIN_TIMEOUT = 300
 MAX_TIMEOUT = 604800
@@ -66,6 +73,20 @@ BLOCKED_FILE = os.path.join(RUN_DIR, "blocked.json")
 LOCK_FILE = os.path.join(RUN_DIR, "lock")
 # kept across reboots and upgrades: a blocked peer must stay blocked
 ALERTS_FILE = "/etc/ns-wgauth/alerts.json"
+# the enrolled devices, kept like the alerts: a lost enrollment would let anyone enroll again
+DEVICES_FILE = "/etc/ns-wgauth/devices.json"
+# seconds a peer without a device can enroll one: from its creation, its new keys or the binding of its server
+DEFAULT_ENROLL_WINDOW = 72 * 3600
+MAX_ENROLL_WINDOW = 30 * 86400
+# seconds a challenge of the login page can be signed, and challenges kept for each address
+CHALLENGE_TTL = 60
+MAX_CHALLENGES = 4
+DEVICE_MESSAGE = "ns-wgauth-device-v1"
+DEVICE_KINDS = ("software", "tpm", "secure-enclave")
+# DER SubjectPublicKeyInfo of a P-256 public key, before its 65 bytes uncompressed point
+P256_SPKI_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
+# a DER ECDSA P-256 signature is at most 72 bytes
+MAX_SIGNATURE = 72
 
 _lock = threading.RLock()
 _lock_depth = 0
@@ -130,6 +151,64 @@ def requires_otp(uci, server):
       - True if the mode is `key_password_otp`
     """
     return get_auth_mode(uci, server) == "key_password_otp"
+
+
+def requires_device(uci, server):
+    """
+    Check if the peers of a WireGuard server must log in from the device enrolled for them.
+
+    Arguments:
+      - uci -- EUci pointer
+      - server -- WireGuard server interface name
+
+    Returns:
+      - True if the server requires the login and its `ns_device_binding` option is set
+    """
+    try:
+        binding = uci.get("network", server, "ns_device_binding", dtype=bool, default=False)
+    except ValueError:
+        # a typo must not open the gate
+        binding = True
+    return is_gated(uci, server) and binding
+
+
+def requires_machine_id(uci, server):
+    """
+    Check if the enrolled device of a peer must also send the ID of its machine.
+
+    Arguments:
+      - uci -- EUci pointer
+      - server -- WireGuard server interface name
+
+    Returns:
+      - True if the server requires device binding and its `ns_machine_id` option is set
+    """
+    try:
+        machine_id = uci.get("network", server, "ns_machine_id", dtype=bool, default=False)
+    except ValueError:
+        machine_id = True
+    return requires_device(uci, server) and machine_id
+
+
+def get_server_public_key(uci, server):
+    """
+    Return the WireGuard public key of a server.
+
+    Arguments:
+      - uci -- EUci pointer
+      - server -- WireGuard server interface name
+
+    Returns:
+      - the base64 public key, empty if it can't be computed
+    """
+    private_key = uci.get("network", server, "private_key", default="")
+    if not private_key:
+        return ""
+    try:
+        process = _run(["wg", "pubkey"], input=private_key)
+    except OSError:
+        return ""
+    return process.stdout.strip() if process.returncode == 0 else ""
 
 
 def is_enabled(uci, section):
@@ -358,11 +437,13 @@ def build_state(uci):
       - uci -- EUci pointer
 
     Returns:
-      - a dictionary with the login service settings and, in `servers`, the gated servers with their enabled
-        peers by reserved IP. A peer without a valid user has an empty `user`
+      - a dictionary with the login service settings; in `servers`, the gated servers with their enabled peers by
+        reserved IP, a peer without a valid user having an empty `user`; in `peer_keys`, the public key of every
+        peer of every WireGuard server, to tell which enrolled devices still belong to their peer
     """
     servers = {}
     for server in list_gated_servers(uci):
+        device = requires_device(uci, server)
         peers = {}
         for peer, options in list_peers(uci, server).items():
             address = options.get("ns_ip", "")
@@ -392,8 +473,17 @@ def build_state(uci):
             "otp": requires_otp(uci, server),
             "timeout": get_session_timeout(uci, server),
             "database": uci.get("network", server, "ns_user_db", default=""),
+            "device_binding": device,
+            "machine_id": requires_machine_id(uci, server),
+            # signed by the devices, see device_message
+            "public_key": get_server_public_key(uci, server) if device else "",
             "peers": peers,
         }
+    peer_keys = {}
+    for server in uci.get("network"):
+        if is_server(uci, server):
+            for peer, options in list_peers(uci, server).items():
+                peer_keys[peer] = options.get("public_key", "")
     return {
         "version": STATE_VERSION,
         "port": get_port(uci),
@@ -406,7 +496,9 @@ def build_state(uci):
         "block_copies": _get_flag(uci, "block_copies", False),
         "max_failures": _get_count(uci, "max_failures", DEFAULT_MAX_FAILURES),
         "lockout_time": _get_count(uci, "lockout_time", DEFAULT_LOCKOUT_TIME),
+        "enroll_window": min(_get_count(uci, "enroll_window", DEFAULT_ENROLL_WINDOW), MAX_ENROLL_WINDOW),
         "servers": servers,
+        "peer_keys": peer_keys,
     }
 
 
@@ -1181,7 +1273,7 @@ def load_alerts():
 
     Returns:
       - a dictionary `{peer: {"public_key": key, "blocked": bool, "events": [event]}}`, every event being
-        `{"time": timestamp, "type": "copy" or "lockout", "user": name, "addresses": [ip]}`
+        `{"time": timestamp, "type": "copy", "lockout" or "device_mismatch", "user": name, "addresses": [ip]}`
     """
     data = _read_json(ALERTS_FILE, {})
     return data if isinstance(data, dict) else {}
@@ -1242,7 +1334,7 @@ def add_alert(peer, public_key, kind, user, addresses, block=False):
     Arguments:
       - peer -- peer section name
       - public_key -- the current public key of the peer
-      - kind -- `copy` or `lockout`
+      - kind -- `copy`, `lockout` or `device_mismatch`
       - user -- the user linked to the peer
       - addresses -- the public IPs involved
       - block -- block the peer until an administrator clears its alerts or generates new keys
@@ -1300,6 +1392,422 @@ def prune_alerts(uci):
         }
         if kept != alerts:
             save_alerts(kept)
+
+
+def load_devices():
+    """
+    Read the devices of the peers, see `verify_device`.
+
+    Returns:
+      - a dictionary `{peer: {"public_key": key, "window_until": timestamp, "device": device}}`: `public_key` is the
+        WireGuard key of the peer the entry belongs to, `window_until` the end of its enrollment window, 0 when
+        closed, `device` None or `{"key": base64 public key, "kind": kind, "name": name, "machine_id": hmac,
+        "enrolled": timestamp, "last_used": timestamp, "endpoint": ip}`
+    """
+    data = _read_json(DEVICES_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_devices(devices):
+    """
+    Write the devices, see `load_devices`.
+
+    Arguments:
+      - devices -- the dictionary returned by `load_devices`
+    """
+    os.makedirs(os.path.dirname(DEVICES_FILE), mode=0o700, exist_ok=True)
+    _write_json(DEVICES_FILE, devices)
+
+
+def peer_device(devices, peer, public_key):
+    """
+    Return the device entry of a peer.
+
+    The entry belongs to the keys of the peer, like the alerts: new keys need a new enrollment.
+
+    Arguments:
+      - devices -- see `load_devices`
+      - peer -- peer section name
+      - public_key -- the current public key of the peer
+
+    Returns:
+      - the entry, None if the peer has none for its current keys
+    """
+    entry = devices.get(peer)
+    if isinstance(entry, dict) and public_key and entry.get("public_key") == public_key:
+        return entry
+    return None
+
+
+def device_state(entry, now=None):
+    """
+    Tell if a peer has a device.
+
+    Arguments:
+      - entry -- see `peer_device`
+      - now -- current UNIX timestamp
+
+    Returns:
+      - `enrolled`, `waiting` if a device can enroll, `closed` if none can
+    """
+    now = int(time.time()) if now is None else now
+    if not entry:
+        return "closed"
+    if isinstance(entry.get("device"), dict):
+        return "enrolled"
+    return "waiting" if _timestamp(entry.get("window_until")) > now else "closed"
+
+
+def sync_devices(state, now=None):
+    """
+    Match the devices with the configuration applied: forget the entries of the peers removed or given new keys,
+    and open the enrollment window of the peers of the servers that require device binding and have no entry yet:
+    new peers, new keys, or a server whose binding was just turned on.
+
+    Arguments:
+      - state -- see `build_state`
+      - now -- current UNIX timestamp
+
+    Returns:
+      - the devices, see `load_devices`
+    """
+    now = int(time.time()) if now is None else now
+    keys = state.get("peer_keys", {})
+    with state_lock():
+        devices = load_devices()
+        kept = {
+            peer: entry
+            for peer, entry in devices.items()
+            if isinstance(entry, dict) and entry.get("public_key") and keys.get(peer) == entry["public_key"]
+        }
+        for server, config in sorted(state["servers"].items()):
+            if not config.get("device_binding"):
+                continue
+            for peer in config["peers"].values():
+                if not peer["public_key"] or peer["peer"] in kept:
+                    continue
+                kept[peer["peer"]] = {
+                    "public_key": peer["public_key"],
+                    "window_until": now + state["enroll_window"],
+                    "device": None,
+                }
+                log(f"device enrollment open: peer={peer['peer']} server={server} for {state['enroll_window']} seconds")
+        if kept != devices:
+            save_devices(kept)
+    return kept
+
+
+def allow_enrollment(peer, public_key, seconds=DEFAULT_ENROLL_WINDOW):
+    """
+    Forget the device of a peer and let a new one enroll at the next login, for example after a reinstall.
+
+    Arguments:
+      - peer -- peer section name
+      - public_key -- the current public key of the peer
+      - seconds -- how long the enrollment stays possible
+
+    Returns:
+      - the end of the enrollment window, as a UNIX timestamp
+    """
+    until = int(time.time()) + min(max(int(seconds), 60), MAX_ENROLL_WINDOW)
+    with state_lock():
+        devices = load_devices()
+        devices[peer] = {"public_key": public_key, "window_until": until, "device": None}
+        save_devices(devices)
+    log(f"device enrollment open: peer={peer} by the administrator")
+    return until
+
+
+def revoke_device(peer, public_key):
+    """
+    Forget the device of a peer: it can't log in until an administrator allows a new enrollment.
+
+    Arguments:
+      - peer -- peer section name
+      - public_key -- the current public key of the peer
+
+    Returns:
+      - True if the peer had a device
+    """
+    with state_lock():
+        devices = load_devices()
+        entry = peer_device(devices, peer, public_key) or {}
+        had_device = isinstance(entry.get("device"), dict)
+        devices[peer] = {"public_key": public_key, "window_until": 0, "device": None}
+        save_devices(devices)
+    log(f"device revoked: peer={peer}")
+    return had_device
+
+
+def device_message(challenge, server_key, peer_key, address, username, machine_id=""):
+    """
+    Build the message a device signs to log in: it ties the signature to one challenge, one server, one peer and
+    one user name.
+
+    Arguments:
+      - challenge -- see `Challenges`
+      - server_key -- WireGuard public key of the server
+      - peer_key -- WireGuard public key of the peer
+      - address -- reserved IP of the peer
+      - username -- the user name, as entered
+      - machine_id -- see `verify_device`, empty when the device doesn't send it
+
+    Returns:
+      - the message, as bytes
+    """
+    fields = [DEVICE_MESSAGE, challenge, server_key, peer_key, address, username, machine_id]
+    return "\n".join(fields).encode()
+
+
+def decode_public_key(text):
+    """
+    Decode the public key of a device.
+
+    Arguments:
+      - text -- base64 DER SubjectPublicKeyInfo
+
+    Returns:
+      - the DER bytes of a P-256 public key, None if `text` isn't one
+    """
+    if not isinstance(text, str):
+        return None
+    try:
+        der = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    prefix = len(P256_SPKI_PREFIX)
+    if len(der) != prefix + 65 or not der.startswith(P256_SPKI_PREFIX) or der[prefix] != 4:
+        return None
+    return der
+
+
+def _decode_signature(text):
+    if not isinstance(text, str):
+        return None
+    try:
+        signature = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    # a DER sequence of two integers
+    if not 8 <= len(signature) <= MAX_SIGNATURE or signature[0] != 0x30:
+        return None
+    return signature
+
+
+def verify_signature(public_key, message, signature):
+    """
+    Check an ECDSA P-256 SHA-256 signature with openssl, already in the image for nginx.
+
+    Arguments:
+      - public_key -- DER SubjectPublicKeyInfo, see `decode_public_key`
+      - message -- the signed bytes
+      - signature -- DER signature
+
+    Returns:
+      - True if the signature is valid
+    """
+    pem = "-----BEGIN PUBLIC KEY-----\n" + base64.encodebytes(public_key).decode() + "-----END PUBLIC KEY-----\n"
+    paths = []
+    try:
+        os.makedirs(RUN_DIR, mode=0o700, exist_ok=True)
+        for suffix, data in ((".pem", pem.encode()), (".sig", signature)):
+            fd, path = tempfile.mkstemp(suffix=suffix, dir=RUN_DIR)
+            paths.append(path)
+            with os.fdopen(fd, "wb") as fp:
+                fp.write(data)
+        process = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-verify", paths[0], "-signature", paths[1]],
+            input=message,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        log(f"cannot check a device signature: {error}", syslog.LOG_ERR)
+        return False
+    finally:
+        for path in paths:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+    return process.returncode == 0
+
+
+def _is_line(value):
+    return isinstance(value, str) and value != "" and "\n" not in value and "\r" not in value
+
+
+def _is_machine_id(value):
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+
+def _device_name(value):
+    if not isinstance(value, str):
+        return ""
+    return "".join(char for char in value if char.isprintable())[:64]
+
+
+def verify_device(state, server, address, peer, username, proof, entry, now=None):
+    """
+    Check the device a peer logs in from.
+
+    The device keeps a P-256 key pair that never leaves it and signs `device_message`. It can be enrolled during the
+    enrollment window of the peer, then only that device can log in. With `machine_id`, the device also sends an
+    HMAC-SHA256 of the ID of its machine, keyed with the server public key, recorded at enrollment and compared at
+    every login. The challenge of the proof must already be checked, see `Challenges`.
+
+    Arguments:
+      - state -- see `build_state`
+      - server -- WireGuard server interface name
+      - address -- reserved IP of the peer
+      - peer -- the peer entry returned by `find_peer`
+      - username -- the user name entered
+      - proof -- the `device` object of the login request: `challenge`, `signature` (base64 DER), `public_key`
+        (base64 DER), `kind`, `name` and `machine_id` (hex)
+      - entry -- the device entry of the peer, see `peer_device`
+      - now -- current UNIX timestamp
+
+    Returns:
+      - `(None, None)` if the enrolled device signed
+      - `(None, device)` if the peer can enroll a device and that device signed: `device` is the record to save
+        after a successful login, see `record_device_login`
+      - `(error, None)` otherwise: `device_not_enrolled` when the peer has no device and can't enroll one,
+        `device_mismatch` for another device, another machine or a wrong signature
+    """
+    now = int(time.time()) if now is None else now
+    config = state["servers"][server]
+    device = entry.get("device") if entry else None
+    enrolling = not isinstance(device, dict)
+    if enrolling and device_state(entry, now) != "waiting":
+        return "device_not_enrolled", None
+    challenge = proof.get("challenge")
+    machine_id = proof.get("machine_id", "")
+    key = decode_public_key(proof.get("public_key"))
+    signature = _decode_signature(proof.get("signature"))
+    if key is None or signature is None or not _is_line(challenge) or not _is_line(username):
+        return "device_mismatch", None
+    if not isinstance(machine_id, str) or (machine_id and not _is_machine_id(machine_id)):
+        return "device_mismatch", None
+    if config["machine_id"] and not machine_id:
+        return "device_mismatch", None
+    if not enrolling:
+        if key != decode_public_key(device.get("key")):
+            return "device_mismatch", None
+        recorded = device.get("machine_id", "")
+        if config["machine_id"] and recorded and not hmac.compare_digest(recorded.encode(), machine_id.encode()):
+            return "device_mismatch", None
+    if not config["public_key"]:
+        log(f"cannot check the devices of {server}: its public key is unknown", syslog.LOG_ERR)
+        return "device_mismatch", None
+    message = device_message(challenge, config["public_key"], peer["public_key"], address, username, machine_id)
+    if not verify_signature(key, message, signature):
+        return "device_mismatch", None
+    if not enrolling:
+        return None, None
+    kind = proof.get("kind") if proof.get("kind") in DEVICE_KINDS else "software"
+    return None, {
+        "key": base64.b64encode(key).decode(),
+        "kind": kind,
+        "name": _device_name(proof.get("name")),
+        "machine_id": machine_id,
+    }
+
+
+def record_device_login(peer, enrolled, machine_id, endpoint, now=None):
+    """
+    Record a successful login from a device: enroll it, or update its last use.
+
+    Arguments:
+      - peer -- the peer entry returned by `find_peer`
+      - enrolled -- the device returned by `verify_device` when the peer enrolls one, None otherwise
+      - machine_id -- the machine ID sent: recorded if the device has none yet, after the server started to ask
+      - endpoint -- public IP of the client
+      - now -- current UNIX timestamp
+
+    Returns:
+      - False if the device can't be enrolled anymore: another one enrolled at the same time, or the window closed
+    """
+    now = int(time.time()) if now is None else now
+    with state_lock():
+        devices = load_devices()
+        entry = peer_device(devices, peer["peer"], peer["public_key"])
+        if enrolled is not None:
+            if device_state(entry, now) != "waiting":
+                return False
+            entry["device"] = dict(enrolled, enrolled=now, last_used=now, endpoint=endpoint)
+            entry["window_until"] = 0
+            log(
+                f"device enrolled: peer={peer['peer']} user={peer['user']} name={enrolled['name']!r} "
+                f"kind={enrolled['kind']} from={endpoint}"
+            )
+        elif entry is not None and isinstance(entry.get("device"), dict):
+            device = entry["device"]
+            device["last_used"] = now
+            device["endpoint"] = endpoint
+            if machine_id and not device.get("machine_id"):
+                device["machine_id"] = machine_id
+                log(f"machine ID recorded: peer={peer['peer']} user={peer['user']}")
+        else:
+            return False
+        save_devices(devices)
+    return True
+
+
+class Challenges:
+    """
+    The challenges the login page gives the devices to sign, see `verify_device`: random, for one address, valid
+    `CHALLENGE_TTL` seconds and for one login. A few are kept for each address, as the client can ask the status
+    again while it signs.
+    """
+
+    def __init__(self, ttl=CHALLENGE_TTL, keep=MAX_CHALLENGES):
+        self.lock = threading.Lock()
+        self.ttl = ttl
+        self.keep = keep
+        # address -> [(time, challenge)]
+        self.issued = {}
+
+    def issue(self, address, now):
+        """
+        Give a new challenge to an address.
+
+        Arguments:
+          - address -- reserved IP of the peer
+          - now -- current UNIX timestamp
+
+        Returns:
+          - the challenge, base64
+        """
+        challenge = base64.b64encode(os.urandom(32)).decode()
+        with self.lock:
+            for other in list(self.issued):
+                self.issued[other] = [item for item in self.issued[other] if now - item[0] < self.ttl]
+                if not self.issued[other]:
+                    del self.issued[other]
+            recent = self.issued.get(address, [])
+            recent.append((now, challenge))
+            self.issued[address] = recent[-self.keep :]
+        return challenge
+
+    def use(self, address, challenge, now):
+        """
+        Use a challenge: it works once, from the address it was given to, before it expires.
+
+        Arguments:
+          - address -- reserved IP of the peer
+          - challenge -- the challenge sent back
+          - now -- current UNIX timestamp
+
+        Returns:
+          - True if the challenge is valid
+        """
+        if not isinstance(challenge, str) or not challenge:
+            return False
+        with self.lock:
+            recent = [item for item in self.issued.get(address, []) if now - item[0] < self.ttl]
+            found = [item for item in recent if hmac.compare_digest(item[1].encode(), challenge.encode())]
+            if found:
+                recent.remove(found[0])
+            self.issued[address] = recent
+        return bool(found)
 
 
 class CopyDetector:
