@@ -118,11 +118,12 @@ def list_servers():
     peers_status = __active_peers()
     gate = wgauth.gate_status()
     alerts = wgauth.load_alerts()
+    devices = wgauth.load_devices()
     interfaces = utils.get_all_by_type(u, "network", "interface")
     for i in interfaces:
         interface = interfaces[i]
         if interface.get("proto") == "wireguard" and interface.get("ns_type", '') == 'server':
-            ret.append(__get_server_configuration(u, i, peers_status, gate, alerts))
+            ret.append(__get_server_configuration(u, i, peers_status, gate, alerts, devices))
     return ret
 
 
@@ -197,6 +198,8 @@ def get_instance_defaults():
     ret["auth_modes"] = list(wgauth.AUTH_MODES)
     # and the fallback endpoints
     ret["max_fallback_endpoints"] = MAX_FALLBACK_ENDPOINTS
+    # and device binding
+    ret["device_binding"] = True
     return ret
 
 
@@ -390,6 +393,18 @@ def __validate_auth_data(e_uci, args, instance=None):
         timeout = args['auth_timeout']
         if isinstance(timeout, bool) or not isinstance(timeout, int) or not (wgauth.MIN_TIMEOUT <= timeout <= wgauth.MAX_TIMEOUT):
             return utils.validation_error('auth_timeout', 'invalid', timeout)
+    for option in ('device_binding', 'machine_id'):
+        if option in args and not isinstance(args[option], bool):
+            return utils.validation_error(option, 'invalid', args[option])
+    # device binding works on the login: without it the options are dropped, see __set_auth_options
+    if args.get('device_binding') and auth_mode == 'key':
+        return utils.validation_error('device_binding', 'login_required', True)
+    if instance is not None and 'device_binding' not in args:
+        device_binding = e_uci.get('network', instance, 'ns_device_binding', dtype=bool, default=False)
+    else:
+        device_binding = args.get('device_binding', False)
+    if args.get('machine_id') and not device_binding:
+        return utils.validation_error('machine_id', 'device_binding_required', True)
     if auth_mode == 'key' or 'auth_mode' not in args:
         return None
     user_db = args.get('user_db', '')
@@ -417,6 +432,18 @@ def __set_auth_options(e_uci, instance, args):
             e_uci.set('network', instance, 'ns_user_db', args['user_db'])
     if 'auth_timeout' in args:
         e_uci.set('network', instance, 'ns_auth_timeout', args['auth_timeout'])
+    # missing, the device options keep their values, like the login: a client that doesn't know them must not turn
+    # the binding off
+    if wgauth.get_auth_mode(e_uci, instance) == 'key':
+        e_uci.delete('network', instance, 'ns_device_binding')
+        e_uci.delete('network', instance, 'ns_machine_id')
+    else:
+        if 'device_binding' in args:
+            e_uci.set('network', instance, 'ns_device_binding', args['device_binding'])
+            if not args['device_binding']:
+                e_uci.set('network', instance, 'ns_machine_id', False)
+        if 'machine_id' in args:
+            e_uci.set('network', instance, 'ns_machine_id', args['machine_id'])
     if wgauth.requires_otp(e_uci, instance):
         # the users linked before OTP was required need a secret
         for peer in wgauth.list_peers(e_uci, instance):
@@ -776,8 +803,31 @@ def __get_peer_alerts(alerts, peer, public_key):
     return bool(entry.get('blocked')), events
 
 
-def __get_server_configuration(u, instance, peers_status, gate, alerts):
-    """Get server configuration with peers, reusing EUci instance and pre-fetched peer status, sessions and alerts."""
+def __iso_time(timestamp):
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat() if timestamp else None
+
+
+def __get_peer_device(devices, peer, public_key):
+    """The device of a peer of a server that requires device binding, see nethsec.wgauth.verify_device."""
+    entry = wgauth.peer_device(devices, peer, public_key)
+    ret = {"state": wgauth.device_state(entry)}
+    if ret["state"] == "waiting":
+        ret["enrollment_until"] = __iso_time(entry.get('window_until', 0))
+    device = entry.get('device') if entry else None
+    if isinstance(device, dict):
+        ret.update({
+            "name": device.get('name', ''),
+            "kind": device.get('kind', ''),
+            "machine_id": bool(device.get('machine_id')),
+            "enrolled": __iso_time(device.get('enrolled', 0)),
+            "last_used": __iso_time(device.get('last_used', 0)),
+            "from": device.get('endpoint', ''),
+        })
+    return ret
+
+
+def __get_server_configuration(u, instance, peers_status, gate, alerts, devices):
+    """Get server configuration with peers, reusing EUci instance and pre-fetched peer status, sessions, alerts and devices."""
     if u.get('network', instance, default=None) is None:
         return utils.generic_error("instance_not_found")
 
@@ -799,6 +849,7 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts):
     # login with user credentials, see nethsec.wgauth
     gated = wgauth.is_gated(u, instance)
     login_url = wgauth.get_login_url(u, instance) if gated else None
+    device_binding = wgauth.requires_device(u, instance)
     sessions = gate['sessions']
     server_sessions = sessions.get(instance, {})
     now = datetime.now(timezone.utc).timestamp()
@@ -829,6 +880,8 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts):
         public_key = u.get('network', p, 'public_key', dtype=str, default='')
         # suspected copies of the configuration and lockouts, see nethsec.wgauth
         peer["blocked"], peer["alerts"] = __get_peer_alerts(alerts, p, public_key)
+        if device_binding:
+            peer["device"] = __get_peer_device(devices, p, public_key)
         if public_key in peers_status:
             peer["active"] = peers_status[public_key]["active"]
             if 'latest_handshake' in peers_status[public_key]:
@@ -852,6 +905,8 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts):
         "auth_mode": wgauth.get_auth_mode(u, instance),
         "user_db": u.get('network', instance, 'ns_user_db', default=''),
         "auth_timeout": wgauth.get_session_timeout(u, instance),
+        "device_binding": device_binding,
+        "machine_id": wgauth.requires_machine_id(u, instance),
         "login_url": login_url or '',
         # false when the login is required but the firewall doesn't enforce it, see ns-wgauth
         "auth_enforced": gated and instance in sessions,
@@ -1160,6 +1215,53 @@ def clear_peer_alerts(args):
     return {"result": "success"}
 
 
+def __get_device_peer(e_uci, args):
+    """Return the server of the peer in args['id'] if it requires device binding, or a validation error."""
+    instance, err = __get_server_peer(e_uci, args)
+    if err:
+        return None, err
+    if not wgauth.requires_device(e_uci, instance):
+        return None, utils.validation_error('id', 'device_binding_not_required', args['id'])
+    return instance, None
+
+
+def allow_device_enrollment(args):
+    """
+    Forget the device of a peer and let a new one enroll at its next login, for example after a reinstall: the
+    enrollment works at once, like logout-peer, without applying the changes.
+    """
+    e_uci = EUci()
+    _instance, err = __get_device_peer(e_uci, args)
+    if err:
+        return err
+    hours = args.get('hours', wgauth.DEFAULT_ENROLL_WINDOW // 3600)
+    if isinstance(hours, bool) or not isinstance(hours, int) or not (1 <= hours <= wgauth.MAX_ENROLL_WINDOW // 3600):
+        return utils.validation_error('hours', 'invalid', hours)
+    public_key = e_uci.get('network', args['id'], 'public_key', default='')
+    try:
+        until = wgauth.allow_enrollment(args['id'], public_key, hours * 3600)
+    except (OSError, RuntimeError):
+        return utils.generic_error('device_enrollment_failed')
+    return {"result": "success", "enrollment_until": __iso_time(until)}
+
+
+def revoke_device(args):
+    """Forget the device of a peer and end its session: it can't log in until a new enrollment is allowed."""
+    e_uci = EUci()
+    instance, err = __get_device_peer(e_uci, args)
+    if err:
+        return err
+    public_key = e_uci.get('network', args['id'], 'public_key', default='')
+    address = e_uci.get('network', args['id'], 'ns_ip', default='')
+    try:
+        wgauth.revoke_device(args['id'], public_key)
+        if address:
+            wgauth.close_session(instance, address, 'device_revoked')
+    except (OSError, RuntimeError, ValueError):
+        return utils.generic_error('device_revoke_failed')
+    return {"result": "success"}
+
+
 HISTORY_DOWNLOADS = '/var/run/ns-api-server/downloads'
 
 
@@ -1252,7 +1354,9 @@ if cmd == 'list':
             "dns": ["1.1.1.1"],
             "auth_mode": "key_password",
             "user_db": "main",
-            "auth_timeout": 28800
+            "auth_timeout": 28800,
+            "device_binding": False,
+            "machine_id": False
         },
         "edit-server": {
             "instance": "wg1",
@@ -1266,7 +1370,9 @@ if cmd == 'list':
             "dns": ["1.1.1.1"],
             "auth_mode": "key_password",
             "user_db": "main",
-            "auth_timeout": 28800
+            "auth_timeout": 28800,
+            "device_binding": False,
+            "machine_id": False
         },
         "delete-server": {"instance": "wg1"},
         "get-peer-defaults": {"instance": "wg1"},
@@ -1300,6 +1406,8 @@ if cmd == 'list':
         "download-peer-2fa": {"id": "peerid"},
         "regenerate-peer-keys": {"id": "peerid"},
         "clear-peer-alerts": {"id": "peerid"},
+        "allow-device-enrollment": {"id": "peerid", "hours": 72},
+        "revoke-device": {"id": "peerid"},
         "list-tunnels": {},
         "add-tunnel": {
             "enabled": True,
@@ -1385,6 +1493,12 @@ else:
     elif action == 'clear-peer-alerts':
         args = json.loads(sys.stdin.read())
         ret = clear_peer_alerts(args)
+    elif action == 'allow-device-enrollment':
+        args = json.loads(sys.stdin.read())
+        ret = allow_device_enrollment(args)
+    elif action == 'revoke-device':
+        args = json.loads(sys.stdin.read())
+        ret = revoke_device(args)
     elif action == 'list-tunnels':
         ret = {"tunnels": list_tunnels()}
     elif action == 'add-tunnel':

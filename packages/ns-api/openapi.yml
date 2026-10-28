@@ -168,6 +168,16 @@ components:
           maximum: 604800
           description: Session length in seconds, default 28800
           example: 28800
+        device_binding:
+          type: boolean
+          description: >-
+            The peers log in only from the device enrolled for them, with a client that signs the login. Requires
+            auth_mode other than key. Missing on edit-server, it keeps its value.
+          example: false
+        machine_id:
+          type: boolean
+          description: The enrolled device must also send the ID of its machine. Requires device_binding.
+          example: false
 
     WireGuardPeerParams:
       type: object
@@ -913,6 +923,10 @@ paths:
                         auth_blocked:
                           type: boolean
                           description: True when the login rules couldn't be loaded and the whole VPN is blocked
+                        device_binding:
+                          type: boolean
+                        machine_id:
+                          type: boolean
                         peers:
                           type: array
                           items:
@@ -941,9 +955,39 @@ paths:
                               blocked:
                                 type: boolean
                                 description: Blocked after a suspected copy of its configuration
+                              device:
+                                type: object
+                                description: Only on a server with device_binding
+                                properties:
+                                  state:
+                                    type: string
+                                    enum: [enrolled, waiting, closed]
+                                  enrollment_until:
+                                    type: string
+                                    format: date-time
+                                    description: Only while waiting
+                                  name:
+                                    type: string
+                                    example: LAPTOP-42
+                                  kind:
+                                    type: string
+                                    example: software
+                                  machine_id:
+                                    type: boolean
+                                    description: True if the ID of its machine is recorded
+                                  enrolled:
+                                    type: string
+                                    format: date-time
+                                  last_used:
+                                    type: string
+                                    format: date-time
+                                  from:
+                                    type: string
+                                    description: Public IP of its latest login
+                                    example: 203.0.113.7
                               alerts:
                                 type: array
-                                description: Suspected copies and lockouts, newest first
+                                description: Suspected copies, lockouts and logins from another device, newest first
                                 items:
                                   type: object
                                   properties:
@@ -952,7 +996,7 @@ paths:
                                       format: date-time
                                     type:
                                       type: string
-                                      enum: [copy, lockout]
+                                      enum: [copy, lockout, device_mismatch]
                                     addresses:
                                       type: array
                                       items:
@@ -1143,6 +1187,69 @@ paths:
       responses:
         "200":
           description: Alerts cleared, or there were none
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WireGuardResult"
+                  - $ref: "#/components/schemas/ValidationError"
+                  - $ref: "#/components/schemas/Error"
+  POST /ubus/ns.wireguard/allow-device-enrollment:
+    post:
+      summary: Forget the device of a peer and let a new one enroll at its next login
+      description: Only on a server with device_binding. No configuration changes, no commit needed.
+      operationId: ns.wireguard.allow-device-enrollment
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: "#/components/schemas/WireGuardPeerId"
+                - type: object
+                  properties:
+                    hours:
+                      type: integer
+                      minimum: 1
+                      maximum: 720
+                      description: How long the enrollment stays open, default 72
+      responses:
+        "200":
+          description: Enrollment open
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      result:
+                        type: string
+                        example: success
+                      enrollment_until:
+                        type: string
+                        format: date-time
+                  - $ref: "#/components/schemas/ValidationError"
+                  - $ref: "#/components/schemas/Error"
+  POST /ubus/ns.wireguard/revoke-device:
+    post:
+      summary: Forget the device of a peer and end its session
+      description: >-
+        Only on a server with device_binding. The peer can't log in until a new enrollment is allowed. No
+        configuration changes, no commit needed.
+      operationId: ns.wireguard.revoke-device
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WireGuardPeerId"
+      responses:
+        "200":
+          description: Device revoked
           content:
             application/json:
               schema:

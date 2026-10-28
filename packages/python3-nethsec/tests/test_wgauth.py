@@ -1,5 +1,7 @@
+import base64
 import json
 import os
+import shutil
 import struct
 import subprocess
 import time
@@ -12,6 +14,7 @@ from nethsec import users, wgauth
 OTP_SECRET = "JBSWY3DPEHPK3PXP"
 PASSWORD = "Secret,1234"
 ALICE = "wg1_ns_aaaaaaaa_peer"
+SERVER_KEY = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
 
 network_db = """
 config interface 'lan'
@@ -143,6 +146,8 @@ class FakeCommands:
             return subprocess.CompletedProcess(cmd, 0, self.handshakes, "")
         if cmd == ["wg", "show", "all", "endpoints"]:
             return subprocess.CompletedProcess(cmd, 0, self.endpoints, "")
+        if cmd == ["wg", "pubkey"]:
+            return subprocess.CompletedProcess(cmd, 0, SERVER_KEY + "\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     def scripts(self):
@@ -186,6 +191,7 @@ def run_dir(tmp_path, monkeypatch):
         attribute = name.split(".")[0].upper() + "_FILE"
         monkeypatch.setattr(wgauth, attribute, path.joinpath(name).as_posix())
     monkeypatch.setattr(wgauth, "ALERTS_FILE", tmp_path.joinpath("etc", "alerts.json").as_posix())
+    monkeypatch.setattr(wgauth, "DEVICES_FILE", tmp_path.joinpath("etc", "devices.json").as_posix())
     return path
 
 
@@ -941,3 +947,271 @@ def test_login_failures_from_many_ips():
     assert len(locked) == 5 * wgauth.PEER_FAILURE_FACTOR
     assert failures.locked_until(ALICE, "192.0.2.99", now + 30, 5, 900) is not None
     assert failures.locked_until(ALICE, "203.0.113.7", now + 30, 5, 900) is None
+
+
+def _bind_devices(u, machine_id=False):
+    u.set("network", "wg1", "ns_device_binding", "1")
+    # the devices sign the public key of the server
+    u.set("network", "wg1", "private_key", "PRIVATE")
+    if machine_id:
+        u.set("network", "wg1", "ns_machine_id", "1")
+    u.save("network")
+
+
+class Device:
+    """A device with a P-256 key, made and used with openssl like a client would."""
+
+    def __init__(self, path):
+        path.mkdir(parents=True, exist_ok=True)
+        self.key = path.joinpath("key.pem").as_posix()
+        subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", self.key], check=True)
+        der = subprocess.run(
+            ["openssl", "ec", "-in", self.key, "-pubout", "-outform", "DER"], check=True, capture_output=True
+        ).stdout
+        self.public_key = base64.b64encode(der).decode()
+
+    def sign(self, message):
+        signature = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-sign", self.key], input=message, check=True, capture_output=True
+        ).stdout
+        return base64.b64encode(signature).decode()
+
+    def proof(self, challenge, username="alice", address="10.103.1.2", peer_key="KEY_ALICE", machine_id=""):
+        message = wgauth.device_message(challenge, SERVER_KEY, peer_key, address, username, machine_id)
+        proof = {
+            "challenge": challenge,
+            "signature": self.sign(message),
+            "public_key": self.public_key,
+            "kind": "software",
+            "name": "LAPTOP-42\n",
+        }
+        if machine_id:
+            proof["machine_id"] = machine_id
+        return proof
+
+
+needs_openssl = pytest.mark.skipif(shutil.which("openssl") is None, reason="openssl is missing")
+
+
+def test_device_options(tmp_path):
+    u = _setup_db(tmp_path)
+    assert not wgauth.requires_device(u, "wg1")
+    assert not wgauth.requires_machine_id(u, "wg1")
+    _bind_devices(u)
+    assert wgauth.requires_device(u, "wg1")
+    assert not wgauth.requires_machine_id(u, "wg1")
+    u.set("network", "wg1", "ns_machine_id", "1")
+    assert wgauth.requires_machine_id(u, "wg1")
+    # a server without the login can't require devices
+    u.set("network", "wg2", "ns_device_binding", "1")
+    u.set("network", "wg2", "ns_machine_id", "1")
+    assert not wgauth.requires_device(u, "wg2")
+    assert not wgauth.requires_machine_id(u, "wg2")
+    # a typo must not turn the binding off
+    u.set("network", "wg1", "ns_device_binding", "maybe")
+    assert wgauth.requires_device(u, "wg1")
+
+
+def test_build_state_devices(tmp_path, mocker):
+    u = _setup_db(tmp_path)
+    _bind_devices(u, machine_id=True)
+    commands = FakeCommands()
+    mocker.patch("nethsec.wgauth._run", commands)
+    state = wgauth.build_state(u)
+    assert state["servers"]["wg1"]["device_binding"]
+    assert state["servers"]["wg1"]["machine_id"]
+    assert state["servers"]["wg1"]["public_key"] == SERVER_KEY
+    assert (["wg", "pubkey"], "PRIVATE") in commands.calls
+    # no key needed without the binding
+    assert not state["servers"]["wg4"]["device_binding"]
+    assert state["servers"]["wg4"]["public_key"] == ""
+    # every peer of every server, disabled and without the login too
+    assert state["peer_keys"][ALICE] == "KEY_ALICE"
+    assert state["peer_keys"]["wg1_ns_bbbbbbbb_peer"] == "KEY_BOB"
+    assert state["peer_keys"]["wg2_ns_cccccccc_peer"] == ""
+    assert state["enroll_window"] == wgauth.DEFAULT_ENROLL_WINDOW
+
+
+def test_device_message():
+    message = wgauth.device_message("CHALLENGE", "SERVER", "PEER", "10.103.1.2", "Alice", "ab" * 32)
+    assert message == b"ns-wgauth-device-v1\nCHALLENGE\nSERVER\nPEER\n10.103.1.2\nAlice\n" + b"ab" * 32
+    assert wgauth.device_message("C", "S", "P", "10.103.1.2", "alice").endswith(b"\nalice\n")
+
+
+def test_decode_public_key():
+    point = bytes([4]) + bytes(range(64))
+    der = wgauth.P256_SPKI_PREFIX + point
+    assert wgauth.decode_public_key(base64.b64encode(der).decode()) == der
+    # compressed point, another algorithm, too short
+    for bad in (
+        wgauth.P256_SPKI_PREFIX + bytes([2]) + bytes(range(64)),
+        bytes(len(wgauth.P256_SPKI_PREFIX)) + point,
+        der[:-1],
+    ):
+        assert wgauth.decode_public_key(base64.b64encode(bad).decode()) is None
+    for bad in ("not base64!", "", None, 42):
+        assert wgauth.decode_public_key(bad) is None
+
+
+def test_challenges():
+    challenges = wgauth.Challenges(ttl=60, keep=2)
+    first = challenges.issue("10.103.1.2", 1000)
+    second = challenges.issue("10.103.1.2", 1001)
+    assert first != second
+    # from another address, unknown or empty: refused
+    assert not challenges.use("10.103.1.3", first, 1002)
+    assert not challenges.use("10.103.1.2", "forged", 1002)
+    assert not challenges.use("10.103.1.2", "", 1002)
+    assert not challenges.use("10.103.1.2", None, 1002)
+    # once only
+    assert challenges.use("10.103.1.2", first, 1002)
+    assert not challenges.use("10.103.1.2", first, 1002)
+    # expired
+    assert not challenges.use("10.103.1.2", second, 1061)
+    # only the latest are kept
+    issued = [challenges.issue("10.103.1.2", 2000) for _ in range(3)]
+    assert not challenges.use("10.103.1.2", issued[0], 2001)
+    assert challenges.use("10.103.1.2", issued[2], 2001)
+    # the expired ones are forgotten
+    challenges.issue("10.103.1.9", 5000)
+    assert list(challenges.issued) == ["10.103.1.9"]
+
+
+def test_sync_devices(tmp_path, mocker, run_dir):
+    u = _setup_db(tmp_path)
+    mocker.patch("nethsec.wgauth._run", FakeCommands())
+    state = wgauth.build_state(u)
+    # without binding, nothing is written
+    assert wgauth.sync_devices(state, now=1000) == {}
+    _bind_devices(u)
+    state = wgauth.build_state(u)
+    devices = wgauth.sync_devices(state, now=1000)
+    # the enabled peers of the server, with or without a user
+    assert sorted(devices) == [ALICE, "wg1_ns_eeeeeeee_peer"]
+    assert devices[ALICE] == {"public_key": "KEY_ALICE", "window_until": 1000 + 72 * 3600, "device": None}
+    assert wgauth.device_state(devices[ALICE], 1001) == "waiting"
+    assert wgauth.device_state(devices[ALICE], 1000 + 72 * 3600) == "closed"
+    assert wgauth.device_state(None, 1001) == "closed"
+    # the window isn't opened again
+    assert wgauth.sync_devices(state, now=500000)[ALICE]["window_until"] == 1000 + 72 * 3600
+    # a revoked peer stays closed
+    assert not wgauth.revoke_device(ALICE, "KEY_ALICE")
+    assert wgauth.sync_devices(state, now=500000)[ALICE]["window_until"] == 0
+    # new keys: a new window
+    u.set("network", ALICE, "public_key", "KEY_ALICE_NEW")
+    state = wgauth.build_state(u)
+    devices = wgauth.sync_devices(state, now=600000)
+    assert devices[ALICE] == {"public_key": "KEY_ALICE_NEW", "window_until": 600000 + 72 * 3600, "device": None}
+    # a removed peer is forgotten
+    state["peer_keys"].pop("wg1_ns_eeeeeeee_peer")
+    state["servers"]["wg1"]["peers"].pop("10.103.1.4")
+    assert "wg1_ns_eeeeeeee_peer" not in wgauth.sync_devices(state, now=600000)
+    # the administrator opens the enrollment
+    until = wgauth.allow_enrollment(ALICE, "KEY_ALICE_NEW", 3600)
+    assert abs(until - time.time() - 3600) < 5
+    assert wgauth.device_state(wgauth.load_devices()[ALICE]) == "waiting"
+
+
+@needs_openssl
+def test_verify_signature(tmp_path, run_dir):
+    device = Device(tmp_path.joinpath("device"))
+    der = wgauth.decode_public_key(device.public_key)
+    signature = base64.b64decode(device.sign(b"hello"))
+    assert wgauth.verify_signature(der, b"hello", signature)
+    assert not wgauth.verify_signature(der, b"hello!", signature)
+    assert not wgauth.verify_signature(der, b"hello", signature[:-1] + bytes([signature[-1] ^ 1]))
+    # the temporary files are removed
+    assert os.listdir(run_dir) == []
+
+
+def _device_state(tmp_path, mocker, machine_id=False):
+    u = _setup_db(tmp_path)
+    _bind_devices(u, machine_id)
+    mocker.patch("nethsec.wgauth._run", FakeCommands())
+    state = wgauth.build_state(u)
+    wgauth.sync_devices(state, now=int(time.time()))
+    _server, peer = wgauth.find_peer(state, "10.103.1.2")
+    return state, peer
+
+
+def _entry(peer):
+    return wgauth.peer_device(wgauth.load_devices(), peer["peer"], peer["public_key"])
+
+
+@needs_openssl
+def test_verify_device_enrollment(tmp_path, mocker, run_dir):
+    state, peer = _device_state(tmp_path, mocker)
+    device = Device(tmp_path.joinpath("device"))
+    verify = wgauth.verify_device
+    # during the window a device enrolls with its first successful login
+    error, enrolled = verify(state, "wg1", "10.103.1.2", peer, "alice", device.proof("C1"), _entry(peer))
+    assert error is None
+    assert enrolled == {"key": device.public_key, "kind": "software", "name": "LAPTOP-42", "machine_id": ""}
+    assert wgauth.record_device_login(peer, enrolled, "", "203.0.113.7")
+    entry = _entry(peer)
+    assert wgauth.device_state(entry) == "enrolled"
+    assert entry["window_until"] == 0
+    assert entry["device"]["endpoint"] == "203.0.113.7"
+    # then only that device
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", device.proof("C2"), entry) == (None, None)
+    other = Device(tmp_path.joinpath("other"))
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", other.proof("C3"), entry) == ("device_mismatch", None)
+    # the key of the device with the signature of another one
+    proof = other.proof("C3")
+    proof["public_key"] = device.public_key
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", proof, entry)[0] == "device_mismatch"
+    # a signature for another challenge, user, address or peer
+    for changed in ({"challenge": "C9"}, {"username": "bob"}, {"address": "10.103.1.4"}, {"peer_key": "KEY_BOB"}):
+        proof = device.proof(**dict({"challenge": "C4"}, **changed))
+        proof["challenge"] = "C4"
+        assert verify(state, "wg1", "10.103.1.2", peer, "alice", proof, entry)[0] == "device_mismatch"
+    # a malformed proof
+    for broken in ({"signature": "!"}, {"public_key": 1}, {"challenge": "a\nb"}, {"machine_id": "XYZ"}):
+        proof = dict(device.proof("C5"), **broken)
+        assert verify(state, "wg1", "10.103.1.2", peer, "alice", proof, entry)[0] == "device_mismatch"
+    # a second enrollment can't happen
+    assert not wgauth.record_device_login(peer, enrolled, "", "203.0.113.7")
+    # the last use is recorded
+    assert wgauth.record_device_login(peer, None, "", "198.51.100.1")
+    assert _entry(peer)["device"]["endpoint"] == "198.51.100.1"
+
+
+@needs_openssl
+def test_verify_device_closed(tmp_path, mocker, run_dir):
+    state, peer = _device_state(tmp_path, mocker)
+    device = Device(tmp_path.joinpath("device"))
+    wgauth.revoke_device(peer["peer"], peer["public_key"])
+    proof = device.proof("C1")
+    error = wgauth.verify_device(state, "wg1", "10.103.1.2", peer, "alice", proof, _entry(peer))
+    assert error == ("device_not_enrolled", None)
+    assert not wgauth.record_device_login(peer, None, "", "203.0.113.7")
+    # without the public key of the server nothing can be checked
+    wgauth.allow_enrollment(peer["peer"], peer["public_key"])
+    state["servers"]["wg1"]["public_key"] = ""
+    assert wgauth.verify_device(state, "wg1", "10.103.1.2", peer, "alice", proof, _entry(peer))[0] == "device_mismatch"
+
+
+@needs_openssl
+def test_verify_device_machine_id(tmp_path, mocker, run_dir):
+    state, peer = _device_state(tmp_path, mocker, machine_id=True)
+    device = Device(tmp_path.joinpath("device"))
+    machine = "ab" * 32
+    verify = wgauth.verify_device
+    # required: a device without it can't enroll
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", device.proof("C1"), _entry(peer))[0] == "device_mismatch"
+    proof = device.proof("C2", machine_id=machine)
+    error, enrolled = verify(state, "wg1", "10.103.1.2", peer, "alice", proof, _entry(peer))
+    assert error is None and enrolled["machine_id"] == machine
+    assert wgauth.record_device_login(peer, enrolled, machine, "203.0.113.7")
+    entry = _entry(peer)
+    proof = device.proof("C3", machine_id=machine)
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", proof, entry) == (None, None)
+    # the same key on another machine
+    proof = device.proof("C4", machine_id="cd" * 32)
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", proof, entry)[0] == "device_mismatch"
+    # enrolled before the server asked for it: the first ID is recorded
+    entry["device"]["machine_id"] = ""
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", proof, entry) == (None, None)
+    wgauth.save_devices({peer["peer"]: entry})
+    assert wgauth.record_device_login(peer, None, "cd" * 32, "203.0.113.7")
+    assert _entry(peer)["device"]["machine_id"] == "cd" * 32

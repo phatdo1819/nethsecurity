@@ -19,11 +19,13 @@ Usage: ns-wgauth COMMAND
   logout PEER     end the session of a peer, PEER is the peer section name
   alerts          print the suspected copies and the lockouts of the peers as JSON
   clear PEER      forget the alerts of a peer and unblock it
+  devices         print the devices enrolled and the enrollments open as JSON
 """
 
 import ipaddress
 import json
 import os
+import shutil
 import socket
 import socketserver
 import subprocess
@@ -192,6 +194,8 @@ def sync(apply=True):
             wgauth.prune_alerts(uci)
         wgauth.apply_ruleset(state, force=apply)
         update_nginx(state)
+        # opens the enrollment of the new peers of the servers that require device binding
+        wgauth.sync_devices(state)
         wgauth.reconcile(state)
     return state
 
@@ -203,6 +207,9 @@ class LoginService:
         self.lock = threading.Lock()
         self.failures = wgauth.LoginFailures()
         self.detector = wgauth.CopyDetector()
+        self.challenges = wgauth.Challenges()
+        # peer -> time of the latest alert for a login from another device
+        self.mismatches = {}
         # (database, user) -> {code: timestamp}, an OTP code works only once
         self.used_codes = {}
 
@@ -237,6 +244,17 @@ class LoginService:
             "no_user": not peer["user"],
             "no_otp": wgauth.otp_missing(state, server, peer),
         }
+        if config["device_binding"]:
+            entry = wgauth.peer_device(wgauth.load_devices(), peer["peer"], peer["public_key"])
+            device_state = wgauth.device_state(entry)
+            # only an app that signs can log in, the browser explains it
+            result["device"] = {
+                "required": True,
+                "enrolled": device_state == "enrolled",
+                "enrollment_open": device_state == "waiting",
+                "machine_id": config["machine_id"],
+                "challenge": self.challenges.issue(address, int(time.time())),
+            }
         left = wgauth.list_sessions().get(server, {}).get(address)
         if left is not None:
             entry = wgauth.load_metadata().get(server, {}).get(address, {})
@@ -244,6 +262,56 @@ class LoginService:
             result["user"] = entry.get("user", "")
             result["expires"] = iso_time(time.time() + left)
         return 200, result
+
+    def failed(self, state, server, address, peer, endpoint, username, now, reason="invalid_credentials"):
+        """Count a failed login, lock out its IP after too many, return the answer."""
+        lockout_time = state["lockout_time"]
+        locked = self.failures.add(peer["peer"], endpoint, now, state["max_failures"], lockout_time)
+        name = username[:64] if isinstance(username, str) else ""
+        wgauth.log(
+            f"login failed: user={name!r} server={server} peer={peer['peer']} address={address} from={endpoint}"
+            + ("" if reason == "invalid_credentials" else f" reason={reason}"),
+            syslog.LOG_WARNING,
+        )
+        if locked:
+            wgauth.log(
+                f"peer {peer['peer']} of user={peer['user']} locked out for {lockout_time} seconds "
+                f"from {', '.join(ip or 'an unknown IP' for ip in locked)}",
+                syslog.LOG_WARNING,
+            )
+            wgauth.add_alert(peer["peer"], peer["public_key"], "lockout", peer["user"], locked)
+        return 401, {"error": reason}
+
+    def check_device(self, state, server, address, peer, data, now):
+        """
+        Check the device of a login on a server that requires device binding, before the password.
+        Returns `(error, None)` to refuse the login, `(None, device)` to go on, `device` being the one to enroll.
+        """
+        proof = data.get("device")
+        if not isinstance(proof, dict):
+            return "device_required", None
+        if not self.challenges.use(address, proof.get("challenge"), now):
+            # the app asks for a new one and tries again
+            return "challenge_expired", None
+        entry = wgauth.peer_device(wgauth.load_devices(), peer["peer"], peer["public_key"])
+        error, enrolling = wgauth.verify_device(state, server, address, peer, data.get("username"), proof, entry, now)
+        if error == "device_not_enrolled":
+            wgauth.log(
+                f"login refused: peer={peer['peer']} of user={peer['user']} has no device and can't enroll one",
+                syslog.LOG_WARNING,
+            )
+        return error, enrolling
+
+    def report_mismatch(self, peer, endpoint, now):
+        """An alert for a login from another device, at most once every COPY_REPORT_INTERVAL for each peer."""
+        with self.lock:
+            if now - self.mismatches.get(peer["peer"], 0) < wgauth.COPY_REPORT_INTERVAL:
+                return
+            self.mismatches[peer["peer"]] = now
+        wgauth.log(
+            f"peer {peer['peer']} of user={peer['user']} tried to log in from another device", syslog.LOG_WARNING
+        )
+        wgauth.add_alert(peer["peer"], peer["public_key"], "device_mismatch", peer["user"], [endpoint])
 
     def code_reused(self, state, server, peer, code, now):
         key = (state["servers"][server]["database"], peer["user"].lower())
@@ -277,25 +345,29 @@ class LoginService:
         if until is not None:
             return 429, {"error": "too_many_attempts", "retry_after": max(int(until - now), 1)}
         username = data.get("username")
+        binding = state["servers"][server]["device_binding"]
+        enrolling = None
+        if binding:
+            # before the password: from another device, the password is never checked
+            error, enrolling = self.check_device(state, server, address, peer, data, int(now))
+            if error == "device_mismatch":
+                self.report_mismatch(peer, endpoint, int(now))
+                return self.failed(state, server, address, peer, endpoint, username, now, error)
+            if error == "challenge_expired":
+                return 401, {"error": error}
+            if error is not None:
+                return 403, {"error": error}
         otp = data.get("otp", "")
         valid = wgauth.check_login(state, server, peer, username, data.get("password"), otp)
         if valid and state["servers"][server]["otp"] and self.code_reused(state, server, peer, otp, now):
             valid = False
         if not valid:
-            locked = self.failures.add(peer["peer"], endpoint, now, max_failures, lockout_time)
-            name = username[:64] if isinstance(username, str) else ""
-            wgauth.log(
-                f"login failed: user={name!r} server={server} peer={peer['peer']} address={address} from={endpoint}",
-                syslog.LOG_WARNING,
-            )
-            if locked:
-                wgauth.log(
-                    f"peer {peer['peer']} of user={peer['user']} locked out for {lockout_time} seconds "
-                    f"from {', '.join(ip or 'an unknown IP' for ip in locked)}",
-                    syslog.LOG_WARNING,
-                )
-                wgauth.add_alert(peer["peer"], peer["public_key"], "lockout", peer["user"], locked)
-            return 401, {"error": "invalid_credentials"}
+            return self.failed(state, server, address, peer, endpoint, username, now)
+        if binding:
+            machine_id = data["device"].get("machine_id", "") if state["servers"][server]["machine_id"] else ""
+            if not wgauth.record_device_login(peer, enrolling, machine_id, endpoint, int(now)):
+                # another device enrolled meanwhile, or the window closed
+                return self.failed(state, server, address, peer, endpoint, username, now, "device_mismatch")
         self.failures.success(peer["peer"], endpoint)
         expires = wgauth.open_session(state, server, address, peer, endpoint)
         return 200, {"result": "success", "user": peer["user"], "expires": iso_time(expires)}
@@ -556,9 +628,26 @@ def check():
         )
     report("OK" if service_listening() else "ERROR", f"the login service answers on {SOCKET}")
     endpoints = wgauth.read_endpoints() or {}
+    stored_devices = wgauth.load_devices()
     for server in servers:
         by_address = {}
-        for peer in state["servers"][server]["peers"].values():
+        config = state["servers"][server]
+        if config["device_binding"]:
+            if not shutil.which("openssl"):
+                report("ERROR", f"{server} requires device binding but openssl is missing: nobody can log in")
+            elif not config["public_key"]:
+                report("ERROR", f"the public key of {server} is unknown: its devices can't log in")
+            else:
+                report("OK", f"{server} requires device binding" + (" and machine IDs" if config["machine_id"] else ""))
+        for peer in config["peers"].values():
+            if config["device_binding"] and peer["user"]:
+                entry = wgauth.peer_device(stored_devices, peer["peer"], peer["public_key"])
+                if wgauth.device_state(entry) == "closed":
+                    report(
+                        "WARNING",
+                        f"peer {peer['peer']} of {server} has no device and its enrollment is closed: it can't log in "
+                        "until an administrator allows the enrollment",
+                    )
             if not peer["user"]:
                 report("WARNING", f"peer {peer['peer']} of {server} has no user: it can't log in")
             elif wgauth.otp_missing(state, server, peer):
@@ -621,6 +710,29 @@ def alerts():
     print(json.dumps(result, indent=2))
 
 
+def devices():
+    result = {}
+    now = int(time.time())
+    for peer, entry in sorted(wgauth.load_devices().items()):
+        if not isinstance(entry, dict):
+            continue
+        item = {"state": wgauth.device_state(entry, now)}
+        if item["state"] == "waiting":
+            item["enrollment_until"] = iso_time(entry.get("window_until", 0))
+        device = entry.get("device")
+        if isinstance(device, dict):
+            item.update(
+                name=device.get("name", ""),
+                kind=device.get("kind", ""),
+                machine_id=bool(device.get("machine_id")),
+                enrolled=iso_time(device.get("enrolled", 0)),
+                last_used=iso_time(device.get("last_used", 0)),
+                **{"from": device.get("endpoint", "")},
+            )
+        result[peer] = item
+    print(json.dumps(result, indent=2))
+
+
 def main():
     command = sys.argv[1] if len(sys.argv) > 1 else ""
     if command == "sync":
@@ -640,6 +752,8 @@ def main():
     elif command == "clear" and len(sys.argv) == 3:
         if not wgauth.clear_alerts(sys.argv[2]):
             print(f"{sys.argv[2]} has no alerts", file=sys.stderr)
+    elif command == "devices":
+        devices()
     else:
         print(__doc__.strip(), file=sys.stderr)
         sys.exit(2)

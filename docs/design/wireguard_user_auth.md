@@ -403,7 +403,9 @@ The goal is that a leaked or copied peer configuration alone doesn't give access
   `roaming` the session follows them, and a copy used while the real device is off or asleep, so without switching,
   keeps the session until it expires.
 - **Configuration, password and OTP secret leaked together** defeat the login: deliver them through different
-  channels, and enroll the OTP in person or over a screen share.
+  channels, and enroll the OTP in person or over a screen share. With
+  [device binding](wireguard_device_binding.md), a server also requires the device enrolled for the peer, so they
+  are useless on another machine, at the cost of a VPN client that signs the login.
 
 Defguard closes the second case differently: its desktop client receives a new preshared key after every MFA
 login, so a copy without that key can't even complete the handshake. That needs a custom client, which this design
