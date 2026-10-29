@@ -215,7 +215,9 @@ components:
           example: ""
         user:
           type: string
-          description: User of the server's users database, required if the server requires the login
+          description: >-
+            User of the server's users database, required if the server requires the login. A user has one peer per
+            server: validation error user_has_peer when another peer of the server already has this user.
           example: alice
 
     WireGuardPeerId:

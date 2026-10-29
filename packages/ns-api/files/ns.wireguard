@@ -638,6 +638,13 @@ def __validate_peer_data(args):
         user_db = e_uci.get('network', args['instance'], 'ns_user_db', default='')
         if not user_db or users.get_user_by_name(e_uci, user, user_db) is None:
             return utils.validation_error('user', 'user_not_found', user)
+        # one peer per user on a server, so the sessions, the logs and the alerts of a user are those of one device.
+        # A peer linked before the rule keeps its user until it's linked to another one.
+        current = e_uci.get('network', args['id'], 'ns_user', default='') if args.get('id') else ''
+        if user.lower() != current.lower():
+            linked = wgauth.peers_by_user(e_uci, args['instance']).get(user.lower(), [])
+            if any(peer != args.get('id') for peer in linked):
+                return utils.validation_error('user', 'user_has_peer', user)
         # the login identifies a peer by its reserved IP: traffic from remote networks would be blocked
         if any(net != '' for net in args['remote_networks']):
             return utils.validation_error('remote_networks', 'not_allowed', args['remote_networks'])

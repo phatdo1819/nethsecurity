@@ -16,7 +16,9 @@ The login is enabled per server, in the network interface of a WireGuard server 
 - `ns_user_db`: the local users database
 - `ns_auth_timeout`: session length in seconds, default `28800` (8 hours), from 300 to 604800
 
-Each peer of such a server is linked to a user with the `ns_user` option. With `key_password_otp` the OTP secret is
+Each peer of such a server is linked to a user with the `ns_user` option, one peer per user and server:
+`ns.wireguard` refuses a second one, and `ns-wgauth check` points out the peers that shared a user before the rule.
+With `key_password_otp` the OTP secret is
 the `openvpn_2fa` option of the user, the one used by OpenVPN Road Warrior. Removing the user's OpenVPN account
 deletes it: the user can't log in until the peer is saved again, which creates a new secret (`ns-wgauth check`
 reports it).
