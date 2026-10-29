@@ -379,6 +379,27 @@ def list_peers(uci, server):
     return utils.get_all_by_type(uci, "network", f"wireguard_{server}") or {}
 
 
+def peers_by_user(uci, server):
+    """
+    Group the peers of a server by their user. A user has one peer per server: `ns.wireguard` refuses a second one,
+    this finds the ones linked before.
+
+    Arguments:
+      - uci -- EUci pointer
+      - server -- WireGuard server interface name
+
+    Returns:
+      - a dictionary `{user: [peer sections]}`, the user names in lowercase as the login compares them, without the
+        peers that have no user
+    """
+    result = {}
+    for peer in list_peers(uci, server):
+        name = uci.get("network", peer, "ns_user", default="")
+        if name:
+            result.setdefault(name.lower(), []).append(peer)
+    return result
+
+
 def get_peer_user(uci, server, peer):
     """
     Return the user linked to a peer.

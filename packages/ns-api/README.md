@@ -8790,7 +8790,8 @@ Parameters:
   in with this peer
 
 On a server that requires the login:
-- `user` validation errors: `required`, `user_not_found`
+- `user` validation errors: `required`, `user_not_found`, `user_has_peer` when another peer of the server, enabled or
+  not, already has this user: a user has one peer per server
 - `remote_networks` must be empty, validation error `not_allowed`: the login identifies the peer by its reserved IP
 
 
@@ -8804,7 +8805,9 @@ api-cli ns.wireguard add-peer --data '{"instance": "wg3", "id": "peerid", "enabl
 Parameters:
 - `id`: the id of the peer, it can be found in the `list-servers` output
 
-All other parameters are the same as in `add-peer`. If `user` is missing, the peer keeps its current user.
+All other parameters are the same as in `add-peer`. If `user` is missing, the peer keeps its current user. A peer
+that shares its user with another peer, linked before the rule of one peer per user, can still be saved with that
+user; `user_has_peer` comes only when the user changes.
 
 ### delete-peer
 

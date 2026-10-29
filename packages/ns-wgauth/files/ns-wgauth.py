@@ -631,6 +631,7 @@ def check():
     stored_devices = wgauth.load_devices()
     for server in servers:
         by_address = {}
+        by_user = {}
         config = state["servers"][server]
         if config["device_binding"]:
             if not shutil.which("openssl"):
@@ -648,6 +649,8 @@ def check():
                         f"peer {peer['peer']} of {server} has no device and its enrollment is closed: it can't log in "
                         "until an administrator allows the enrollment",
                     )
+            if peer["user"]:
+                by_user.setdefault(peer["user"].lower(), []).append(peer["peer"])
             if not peer["user"]:
                 report("WARNING", f"peer {peer['peer']} of {server} has no user: it can't log in")
             elif wgauth.otp_missing(state, server, peer):
@@ -665,6 +668,13 @@ def check():
                     f"peers {', '.join(peers)} of {server} send from the same public IP {address}: if they are on "
                     "different networks, the router in front of the firewall hides the IPs of the clients, "
                     "set lock_endpoint to 0",
+                )
+        for user, peers in sorted(by_user.items()):
+            if len(peers) > 1:
+                report(
+                    "WARNING",
+                    f"user {user} has the peers {', '.join(sorted(peers))} on {server}: a user has one peer per server, "
+                    "link the others to their own users or delete them",
                 )
     return 1 if errors else 0
 

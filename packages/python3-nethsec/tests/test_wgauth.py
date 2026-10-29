@@ -258,6 +258,17 @@ def test_get_peer_user(tmp_path):
     assert wgauth.get_peer_user(u, "wg1", ALICE) is None
 
 
+def test_peers_by_user(tmp_path):
+    u = _setup_db(tmp_path)
+    # alice has a peer on wg4 too: one per server
+    assert wgauth.peers_by_user(u, "wg1") == {"alice": [ALICE], "bob": ["wg1_ns_bbbbbbbb_peer"]}
+    assert wgauth.peers_by_user(u, "wg4") == {"alice": ["wg4_ns_dddddddd_peer"]}
+    assert wgauth.peers_by_user(u, "wg2") == {}
+    # linked before the rule, in another case: the same user for the login
+    u.set("network", "wg1_ns_eeeeeeee_peer", "ns_user", "Alice")
+    assert wgauth.peers_by_user(u, "wg1")["alice"] == [ALICE, "wg1_ns_eeeeeeee_peer"]
+
+
 def test_build_state(tmp_path):
     u = _setup_db(tmp_path)
     state = wgauth.build_state(u)

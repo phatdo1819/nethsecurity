@@ -108,7 +108,14 @@ Option of the peer section (`network.wg<N>_<id>_peer`):
 
 - `ns_user`: the user name in the server's `ns_user_db`, required on a gated server
 
-The link lives on the peer, so a user can have several peers, one per device, on one or more servers.
+The link lives on the peer. A user has one peer per server, as an OpenVPN Road Warrior user has one account per
+server: the sessions, the logs, the alerts and the device of a user on a server are those of one peer, which keeps the
+troubleshooting simple and a second device a decision of the administrator (a second user). `add-peer` and
+`edit-peer` refuse a user that another peer of the server already has, enabled or not (`user_has_peer`); the names
+are compared without case, as the login does. A user can have a peer on each of several servers. Peers that shared a
+user before the rule keep working and can still be saved; the UI and `ns-wgauth check` point them out until they
+are linked to their own users or deleted. Turning the login on again for a server whose peers kept their users from
+before isn't refused, for the same reason: the users can only be changed while the login is required.
 Each peer logs in separately. A peer without a user, or linked to a user that doesn't exist anymore, can't log in.
 
 ### Users
@@ -434,7 +441,8 @@ The firewall can sit behind a router that forwards the WireGuard UDP port to it,
   `db_not_local`; `auth_timeout` `invalid`. On `edit-server`, missing login options keep their current values:
   a client that doesn't know them, like an older UI, can't turn the login off.
 - `add-peer`, `edit-peer`: new parameter `user`, required on gated servers; on edit, a missing `user` keeps the
-  current one. Validation errors: `user` `required`, `user_not_found`; `remote_networks` `not_allowed`.
+  current one. Validation errors: `user` `required`, `user_not_found`, `user_has_peer` (another peer of the server
+  has this user, see above); `remote_networks` `not_allowed`.
 - `list-servers`: servers also return `auth_mode`, `user_db`, `auth_timeout`, `login_url`, `auth_enforced` and
   `auth_blocked`; peers also return `user`, `authenticated`, `auth_expires`, `blocked` and `alerts` (newest first,
   `{"time": "...", "type": "copy" | "lockout", "addresses": ["198.51.100.20"]}`).
