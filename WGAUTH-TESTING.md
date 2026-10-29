@@ -88,7 +88,8 @@ Don't forward the login port 8181: the login page is reached through the tunnel.
 
 1. **Users and objects > Users database**: in the local database, add a user, for example `alice`, with a
    password.
-2. **VPN > WireGuard tunnel > Server tunnel > Add server** (or edit an existing one):
+2. **VPN > WireGuard tunnel > Add server** (or edit an existing one; each server has its own tab, named after it,
+   and more than five share a **Server tunnels** tab with a list):
    - **Public endpoint**: the public IP or name of your router
    - **Authentication**: *Key, user password and OTP*
    - **Users database**: *Local database*
@@ -165,6 +166,8 @@ while the laptop is on Wi-Fi. The detection needs the two devices active at the 
 | Change the password of `alice` and apply | The session ends. Before you apply, nothing changes: the old password still works |
 | Set the server to *WireGuard key*, save **without applying**, wait a minute | The LAN still needs the login. Apply: it doesn't anymore. Set it back to *Key, user password and OTP* and apply |
 | A peer without a user | The peer shows **No user**; its login page says it isn't linked to a user |
+| Add a second peer for `alice` on the same server, or move another peer to `alice` | Refused: "This user already has a peer on this server". In the user list of the peer, `alice` is greyed out with "Has the peer ..." |
+| Peers that shared a user before this rule | The **User** column of each shows a warning with the other peers; `ns-wgauth check` warns too. They still log in: link each to its own user, or delete the extra ones |
 | Disable the peer, or **Log out** in the peer menu | The session ends |
 | The same OTP code used twice | The second login is refused |
 | `fw4 reload`, or edit another peer of the same server and apply | The session stays |
