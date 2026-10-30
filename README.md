@@ -1,5 +1,22 @@
 # NethSecurity
 
+> [!WARNING]
+> **This is a personal fork, and its changes are a proof of concept.** It isn't the official NethSecurity: Nethesis
+> didn't make or review these changes and doesn't support them. They were written by an AI (Claude, by Anthropic),
+> directed and tested by one person on test firewalls, and no security expert has reviewed them. Don't install the
+> images of this fork on a firewall you rely on. For the official firewall, see
+> [NethServer/nethsecurity](https://github.com/NethServer/nethsecurity).
+>
+> What the fork adds, each with a guide to test it:
+> - **OpenVPN Road Warrior with several servers**: branch `feat/ovpnrw-multi-instance`, test images from `ci-fork`,
+>   [FORK-TESTING.md](https://github.com/phatdo1819/nethsecurity/blob/feat/ovpnrw-multi-instance/FORK-TESTING.md).
+> - **A login for WireGuard servers** (`ns-wgauth`): the peers log in on a web page, with the password of a local
+>   user and an optional authenticator code, before their traffic passes; with device binding, fallback addresses,
+>   connection history and one peer per user. Branch `feat/wireguard-user-auth`, test images from `ci-wgauth`,
+>   [WGAUTH-TESTING.md](https://github.com/phatdo1819/nethsecurity/blob/ci-wgauth/WGAUTH-TESTING.md).
+>
+> The rest of this page is the README of the official project.
+
 [![License](https://img.shields.io/badge/License-GPL--2.0-blue.svg)](https://opensource.org/licenses/GPL-2.0)
 [![Build Status](https://github.com/NethServer/nethsecurity/actions/workflows/build-image.yml/badge.svg)](https://github.com/NethServer/nethsecurity/actions/workflows/build-image.yml)
 [![Documentation Status](https://img.shields.io/badge/docs-stable-brightgreen.svg)](https://docs.nethsecurity.org/)
