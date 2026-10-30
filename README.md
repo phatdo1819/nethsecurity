@@ -14,8 +14,27 @@
 >   user and an optional authenticator code, before their traffic passes; with device binding, fallback addresses,
 >   connection history and one peer per user. Branch `feat/wireguard-user-auth`, test images from `ci-wgauth`,
 >   [WGAUTH-TESTING.md](https://github.com/phatdo1819/nethsecurity/blob/ci-wgauth/WGAUTH-TESTING.md).
->
-> The rest of this page is the README of the official project.
+
+### The WireGuard login
+
+With made-up names and documentation addresses, not a real firewall.
+
+| | |
+| --- | --- |
+| ![A server with the login: its login page, fallback address and device binding; each peer with its user, connection, login state and device, one of them blocked as a suspected copy](screenshots/wireguard-server.png) | ![The login settings of a server: WireGuard key only, key and password, or key, password and OTP; the users database, the session length, device binding](screenshots/wireguard-server-login.png) |
+| A server that requires the login: who is connected, logged in, and from which device. A configuration used from two places at once blocks its peer. | Its settings: the key alone, or also a password and an OTP code; the users database, the session length, device binding. |
+| ![The peer of alice: the users that already have a peer on this server are greyed out](screenshots/wireguard-peer-user.png) | ![The connection history: each connection of the peers of the servers, its user, addresses, length and traffic](screenshots/wireguard-connections.png) |
+| A peer is linked to a user, one peer per user on a server. | The connection history of the servers, recorded from the handshakes. |
+
+The login page, here on a phone. On a server without device binding (here "Contractors"), the peers log in with any
+browser, as with the official WireGuard apps. With device binding (Head office), only the app enrolled on the device
+can log in, and the page says so.
+
+<img src="screenshots/login-page.png" alt="The login page of a server without device binding: username, password and OTP code" width="240"> <img src="screenshots/login-page-done.png" alt="The same page once logged in: when the session ends" width="240"> <img src="screenshots/login-page-device.png" alt="The login page of a server with device binding: a web browser can't log in, only the VPN app on the enrolled device" width="240">
+
+---
+
+The rest of this page is the README of the official project.
 
 [![License](https://img.shields.io/badge/License-GPL--2.0-blue.svg)](https://opensource.org/licenses/GPL-2.0)
 [![Build Status](https://github.com/NethServer/nethsecurity/actions/workflows/build-image.yml/badge.svg)](https://github.com/NethServer/nethsecurity/actions/workflows/build-image.yml)
