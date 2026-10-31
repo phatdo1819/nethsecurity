@@ -314,9 +314,16 @@ Without the redirect, the `prerouting` chain and the rules on ports 8180 and 815
     2 minutes even when idle. The check remembers the latest handshake it has seen: a commit that touches a
     server restarts its interface (`restart-wireguard.py`) and resets the handshakes, and that must not end the
     sessions of its peers
-  - with `lock_endpoint` set to `1` (the default), the peer sends from another public IP than at login
-    (`wg show all endpoints`, the port is ignored). With `roaming` the session follows the peer to its new IP.
-    See [Copied configurations](#copied-configurations)
+  - with `lock_endpoint` set to `1` (the default), the session stayed paused for 5 minutes (`PAUSE_LIMIT`): the
+    peer sent from another public IP than at login and didn't come back to it. See
+    [Copied configurations](#copied-configurations)
+  - a paused session reaches its expiration time: without its element, the nftables timeout doesn't apply
+- With `lock_endpoint` set to `1`, the session is locked to the public IP of the login (`wg show all endpoints`,
+  the port is ignored), checked every 5 seconds and on every status request (`follow_endpoints` in
+  `nethsec.wgauth`). When the peer sends from another IP, the session is **paused**: its element is removed from the
+  set, its connections are cut, its metadata stays with a `paused` time. When the peer sends from the IP of the login
+  again, the element comes back with the time the session has left, without a new login. With `roaming` the
+  session follows the peer to its new IP, and `0` disables the lock.
 - Logout: from the login page, or by the administrator with `ns.wireguard logout-peer` or `ns-wgauth logout`.
 - Sessions live only in kernel memory and in `/var/run`: a reboot or an HA failover logs everyone out.
 
@@ -400,8 +407,12 @@ The goal is that a leaked or copied peer configuration alone doesn't give access
   a lockout becomes an alert of the peer. The page doesn't tell the username.
 - **The configuration used while the user is logged in**: WireGuard can't tell apart two devices with the same key,
   and the session belongs to the key. With `lock_endpoint` set to `1`, the session is bound to the public IP the
-  client had at login: when the copy sends from another network the session ends within 15 seconds. The legitimate
-  user must log in again; while both devices are active, neither keeps a session.
+  client had at login: when the copy sends from another network the session is paused within 5 seconds, at once if
+  the copy asks the login page. The copy gets nothing; when it goes away, the next packet of the legitimate device
+  resumes the session, so its user doesn't log in again. While both devices stay active, neither keeps a session,
+  and the copy detection ends it. With [device binding](wireguard_device_binding.md), the app of another device
+  learns from the status of the login page that the configuration is enrolled elsewhere, and disconnects before
+  the endpoint switches back and forth.
 - **Two devices at once**: WireGuard sends to the public IP of the latest packet received, so while two devices with
   the same key are active the endpoint of the peer keeps switching between their IPs. Every 5 seconds the daemon
   reads the endpoints of the gated peers (`CopyDetector` in `nethsec.wgauth`): three changes within 5 minutes that go
@@ -416,7 +427,8 @@ The goal is that a leaked or copied peer configuration alone doesn't give access
 - **The response to a leak**: generate new keys for the peer (`ns.wireguard regenerate-peer-keys`), apply, and give
   the new configuration to the user. Every copy of the old one stops working, even with the password.
 - **Limits**: two devices behind the same public IP (the same office or home network) can't be told apart. With
-  `lock_endpoint` set to `1`, a user who changes network, for example from Wi-Fi to 4G, logs in again; with
+  `lock_endpoint` set to `1`, a user who changes network, for example from Wi-Fi to 4G, logs in again (the session
+  is paused, so the login page asks for the login, and it ends after 5 minutes); with
   `roaming` the session follows them, and a copy used while the real device is off or asleep, so without switching,
   keeps the session until it expires.
 - **Configuration, password and OTP secret leaked together** defeat the login: deliver them through different

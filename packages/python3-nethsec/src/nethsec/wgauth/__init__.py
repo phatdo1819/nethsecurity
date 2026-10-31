@@ -63,6 +63,9 @@ COPY_WINDOW = 300
 COPY_CHANGES = 3
 # while both devices stay active the copy is seen again and again: one alert per hour is enough
 COPY_REPORT_INTERVAL = 3600
+# seconds a session stays paused while its peer sends from another public IP than at login, with lock_endpoint set to
+# strict, see follow_endpoints: after that, the device that logged in isn't coming back, the session ends
+PAUSE_LIMIT = 300
 MAX_ALERTS = 20
 ALERT_AGE = 30 * 86400
 TABLE = "ns_wgauth"
@@ -1305,7 +1308,20 @@ def close_session(server, address, reason):
         _flush_connections(address)
         user = entry.get("user", "") if isinstance(entry, dict) else ""
         log(f"logout: user={user} server={server} address={address} reason={reason}")
-    return existed
+    return existed or is_paused(entry)
+
+
+def is_paused(entry):
+    """
+    Tell if a session is paused, see `follow_endpoints`: it has no element in the table, only its metadata.
+
+    Arguments:
+      - entry -- the session metadata, see `load_metadata`
+
+    Returns:
+      - True if the session is paused
+    """
+    return isinstance(entry, dict) and _timestamp(entry.get("paused")) > 0
 
 
 def read_handshakes():
@@ -1699,6 +1715,20 @@ def device_message(challenge, server_key, peer_key, address, username, machine_i
     """
     fields = [DEVICE_MESSAGE, challenge, server_key, peer_key, address, username, machine_id]
     return "\n".join(fields).encode()
+
+
+def device_key_id(key):
+    """
+    Return the ID of the key of a device, as the app of the device computes it: the SHA-256 of its DER public key.
+
+    Arguments:
+      - key -- base64 DER SubjectPublicKeyInfo, see `decode_public_key`
+
+    Returns:
+      - the ID, 64 lowercase hex digits, empty if `key` isn't a P-256 public key
+    """
+    der = decode_public_key(key)
+    return hashlib.sha256(der).hexdigest() if der else ""
 
 
 def decode_public_key(text):
@@ -2113,9 +2143,100 @@ def report_copy(state, public_key, addresses):
     return None
 
 
-def session_problem(state, server, address, entry, handshakes, now, endpoints=None, blocked=()):
+def endpoint_action(state, entry, current):
     """
-    Check if an open session must end.
+    Decide what the lock of the public IP does with a session, see `follow_endpoints`.
+
+    Arguments:
+      - state -- see `build_state`
+      - entry -- the session metadata, see `load_metadata`
+      - current -- the public IP the peer sends from, see `read_endpoints`, None if unknown
+
+    Returns:
+      - `pause`, `resume` or None
+    """
+    if not isinstance(entry, dict):
+        return None
+    paused = is_paused(entry)
+    if state["lock_endpoint"] != "strict":
+        # the lock was turned off meanwhile
+        return "resume" if paused else None
+    if not current or not entry.get("endpoint"):
+        # unknown right after an interface restart, until the peer sends again, or not recorded at login
+        return None
+    if current != entry["endpoint"]:
+        return None if paused else "pause"
+    return "resume" if paused else None
+
+
+def follow_endpoints(state, endpoints, now=None, only=None):
+    """
+    Lock the sessions to the public IP their peer logged in from, with `lock_endpoint` set to strict.
+
+    When the peer sends from another IP, its key is used by another device, or the device moved to another network:
+    the session is paused, the peer is blocked again and its connections are cut, but the session doesn't end. It
+    resumes, for the time it has left, when the peer sends from the IP of the login again: when a copy of the
+    configuration goes away, the device that logged in gets its session back without a new login. A session paused
+    for `PAUSE_LIMIT` seconds ends, see `session_problem`.
+
+    Arguments:
+      - state -- see `build_state`
+      - endpoints -- see `read_endpoints`, None if unknown
+      - now -- current UNIX timestamp
+      - only -- the `(server, address)` of the one session to check
+
+    Returns:
+      - the list of `(server, address, action)`, `action` being `pause` or `resume`
+    """
+    now = int(time.time()) if now is None else now
+    done = []
+    with state_lock():
+        metadata = load_metadata()
+        for server, entries in sorted(metadata.items()):
+            config = state["servers"].get(server)
+            if config is None or not isinstance(entries, dict):
+                continue
+            for address, entry in sorted(entries.items()):
+                if only is not None and only != (server, address):
+                    continue
+                peer = config["peers"].get(address)
+                if peer is None or not isinstance(entry, dict) or entry.get("public_key") != peer["public_key"]:
+                    # `reconcile` ends it
+                    continue
+                current = (endpoints or {}).get(peer["public_key"])
+                action = endpoint_action(state, entry, current)
+                if action == "pause":
+                    _nft_script(
+                        f"add element {_element(server, address)}\ndelete element {_element(server, address)}\n"
+                    )
+                    entry["paused"] = now
+                elif action == "resume":
+                    left = _timestamp(entry.get("expires")) - now
+                    if left <= 0:
+                        # expired meanwhile: `reconcile` ends it
+                        continue
+                    _nft_script(f"add element inet {TABLE} auth_{server} {{ {address} timeout {left}s }}\n")
+                    entry.pop("paused", None)
+                if action:
+                    done.append((server, address, action, entry, current))
+        if done:
+            save_metadata(metadata)
+    for server, address, action, entry, current in done:
+        who = f"peer {entry.get('peer', '')} of user={entry.get('user', '')}"
+        if action == "pause":
+            _flush_connections(address)
+            log(
+                f"session paused: {who} sends from {current}, it logged in from {entry['endpoint']}",
+                syslog.LOG_WARNING,
+            )
+        else:
+            log(f"session resumed: {who} sends from {entry['endpoint']} again")
+    return [(server, address, action) for server, address, action, _entry, _current in done]
+
+
+def session_problem(state, server, address, entry, handshakes, now, blocked=()):
+    """
+    Check if a session must end, an open or a paused one.
 
     Arguments:
       - state -- see `build_state`
@@ -2124,7 +2245,6 @@ def session_problem(state, server, address, entry, handshakes, now, endpoints=No
       - entry -- the session metadata, see `load_metadata`
       - handshakes -- see `read_handshakes`, None skips the check of disconnected peers
       - now -- current UNIX timestamp
-      - endpoints -- see `read_endpoints`, None skips the check of the public IP
       - blocked -- the peer section names that are blocked
 
     Returns:
@@ -2144,11 +2264,13 @@ def session_problem(state, server, address, entry, handshakes, now, endpoints=No
         return "user_changed"
     if peer["peer"] in blocked:
         return "blocked"
-    if endpoints is not None and state["lock_endpoint"] == "strict" and entry.get("endpoint"):
-        # unknown right after an interface restart, until the peer sends again
-        current = endpoints.get(peer["public_key"])
-        if current and current != entry["endpoint"]:
+    if is_paused(entry):
+        if now - _timestamp(entry["paused"]) > PAUSE_LIMIT:
+            # the device that logged in didn't come back: another device kept the key, or it changed network
             return "endpoint_changed"
+        # no element in the table, so no nftables timeout
+        if _timestamp(entry.get("expires")) <= now:
+            return "expired"
     if handshakes is not None and state["idle_timeout"] > 0:
         # restarting the interface resets the handshakes: count from the latest one ever seen, or from the login
         latest = max(
@@ -2167,7 +2289,8 @@ def _timestamp(value):
 
 def reconcile(state):
     """
-    End the sessions that are no longer valid and forget the expired ones.
+    End the sessions that are no longer valid and forget the expired ones, then pause or resume the others, see
+    `follow_endpoints`.
 
     Arguments:
       - state -- see `build_state`
@@ -2190,39 +2313,41 @@ def reconcile(state):
         }
         now = int(time.time())
         changed = False
-        for server, elements in sessions.items():
-            for address in elements:
-                entry = metadata.get(server, {}).get(address)
-                reason = session_problem(state, server, address, entry, handshakes, now, endpoints, blocked)
-                if reason:
-                    ended.append((server, address, reason))
-                    if reason == "endpoint_changed":
-                        public_key = state["servers"][server]["peers"][address]["public_key"]
-                        log(
-                            f"peer {entry['peer']} of user={entry.get('user', '')} sends from {endpoints[public_key]}, "
-                            f"it logged in from {entry['endpoint']}: the user must log in again"
-                        )
-                    continue
-                public_key = state["servers"][server]["peers"][address]["public_key"]
-                latest = (handshakes or {}).get(public_key, 0)
-                if latest > _timestamp(entry.get("seen")):
-                    entry["seen"] = latest
-                    changed = True
-                current = (endpoints or {}).get(public_key)
-                if current and current != entry.get("endpoint"):
-                    # unknown at login, or the client moved to another network with lock_endpoint set to roaming
-                    if entry.get("endpoint"):
-                        user = entry.get("user", "")
-                        log(f"peer {entry['peer']} of user={user} moved from {entry['endpoint']} to {current}")
-                    entry["endpoint"] = current
-                    changed = True
+        found = {(server, address) for server, elements in sessions.items() for address in elements}
+        found |= {(server, address) for server, entries in metadata.items() for address in entries}
+        for server, address in sorted(found):
+            entry = metadata.get(server, {}).get(address)
+            if address not in sessions.get(server, {}) and not is_paused(entry):
+                # the nftables timeout already removed it, only the metadata is left
+                ended.append((server, address, "expired"))
+                continue
+            reason = session_problem(state, server, address, entry, handshakes, now, blocked)
+            if reason:
+                ended.append((server, address, reason))
+                if reason == "endpoint_changed":
+                    log(
+                        f"peer {entry['peer']} of user={entry.get('user', '')} didn't come back to {entry['endpoint']} "
+                        f"in {PAUSE_LIMIT} seconds: the user must log in again"
+                    )
+                continue
+            public_key = state["servers"][server]["peers"][address]["public_key"]
+            latest = (handshakes or {}).get(public_key, 0)
+            if latest > _timestamp(entry.get("seen")):
+                entry["seen"] = latest
+                changed = True
+            current = (endpoints or {}).get(public_key)
+            # with lock_endpoint set to strict, the IP of the login stays: follow_endpoints pauses the session
+            moved = entry.get("endpoint") and state["lock_endpoint"] == "roaming"
+            if current and current != entry.get("endpoint") and (moved or not entry.get("endpoint")):
+                # unknown at login, or the client moved to another network
+                if entry.get("endpoint"):
+                    user = entry.get("user", "")
+                    log(f"peer {entry['peer']} of user={user} moved from {entry['endpoint']} to {current}")
+                entry["endpoint"] = current
+                changed = True
         if changed:
             save_metadata(metadata)
-        # the nftables timeout already removed the expired sessions, only the metadata is left
-        for server, entries in metadata.items():
-            for address in entries:
-                if address not in sessions.get(server, {}):
-                    ended.append((server, address, "expired"))
         for server, address, reason in ended:
             close_session(server, address, reason)
+        follow_endpoints(state, endpoints, now)
     return ended
