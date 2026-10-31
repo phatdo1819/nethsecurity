@@ -33,6 +33,7 @@ import sys
 import syslog
 import threading
 import time
+import urllib.parse
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler
 
@@ -43,10 +44,10 @@ SOCKET = "/var/run/ns-wgauth.sock"
 NGINX_CONF = "/etc/nginx/conf.d/ns-wgauth.conf"
 NGINX_MAIN_CONF = "/etc/nginx/uci.conf"
 WEB_ROOT = "/www-wgauth"
-# seconds between two checks of the endpoints, see wgauth.CopyDetector
+# seconds between two checks of the endpoints, see wgauth.CopyDetector: also the longest time a copied configuration
+# can share a session with lock_endpoint set to strict, see wgauth.follow_endpoints
 WATCH_INTERVAL = 5
-# seconds between two checks of the gate and of the sessions: also the longest time a copied configuration can
-# share a session with lock_endpoint set to strict
+# seconds between two checks of the gate and of the sessions
 SYNC_INTERVAL = 15
 MAX_BODY = 4096
 OTP_REUSE_WINDOW = 120
@@ -230,12 +231,23 @@ class LoginService:
             return None, None
         return server, peer
 
-    def status(self, address, host):
+    def status(self, address, host, query=None):
+        """
+        The state of the peer that asks. The app of a device sends `device`, the ID of its device key for the peer, see
+        wgauth.device_key_id, empty when it has none: with device binding, `this_device` tells it whether it's the
+        enrolled device, so another one disconnects before its handshakes take the session of the enrolled one.
+        """
         state = current_state()
         server, peer = self.target(state, address, host)
         if server is None:
             return 403, {"error": "forbidden"}
         config = state["servers"][server]
+        now = int(time.time())
+        # the request just came through the tunnel: the endpoint of the peer is the public IP of the device that asks
+        endpoints = wgauth.read_endpoints()
+        endpoint = (endpoints or {}).get(peer["public_key"], "")
+        # at once: a session isn't shared with another device even for the seconds until the next check
+        wgauth.follow_endpoints(state, endpoints, now, only=(server, address))
         result = {
             "authenticated": False,
             "otp_required": config["otp"],
@@ -253,8 +265,14 @@ class LoginService:
                 "enrolled": device_state == "enrolled",
                 "enrollment_open": device_state == "waiting",
                 "machine_id": config["machine_id"],
-                "challenge": self.challenges.issue(address, int(time.time())),
+                "challenge": self.challenges.issue(address, now),
             }
+            key_id = (query or {}).get("device")
+            if key_id is not None and device_state == "enrolled":
+                this_device = key_id != "" and key_id == wgauth.device_key_id(entry["device"].get("key"))
+                result["device"]["this_device"] = this_device
+                if not this_device:
+                    self.report_mismatch(peer, endpoint, now, "connect")
         left = wgauth.list_sessions().get(server, {}).get(address)
         if left is not None:
             entry = wgauth.load_metadata().get(server, {}).get(address, {})
@@ -302,14 +320,16 @@ class LoginService:
             )
         return error, enrolling
 
-    def report_mismatch(self, peer, endpoint, now):
-        """An alert for a login from another device, at most once every COPY_REPORT_INTERVAL for each peer."""
+    def report_mismatch(self, peer, endpoint, now, action="log in"):
+        """An alert for another device, at most once every COPY_REPORT_INTERVAL for each peer."""
         with self.lock:
             if now - self.mismatches.get(peer["peer"], 0) < wgauth.COPY_REPORT_INTERVAL:
                 return
             self.mismatches[peer["peer"]] = now
         wgauth.log(
-            f"peer {peer['peer']} of user={peer['user']} tried to log in from another device", syslog.LOG_WARNING
+            f"peer {peer['peer']} of user={peer['user']} tried to {action} from another device"
+            + (f" at {endpoint}" if endpoint else ""),
+            syslog.LOG_WARNING,
         )
         wgauth.add_alert(peer["peer"], peer["public_key"], "device_mismatch", peer["user"], [endpoint])
 
@@ -381,11 +401,20 @@ class LoginService:
         return 200, {"result": "success"}
 
     def watch(self, state):
-        """End the session of the peers whose key looks used by two devices, see wgauth.CopyDetector."""
-        if not state["detect_copies"]:
+        """
+        Pause the sessions of the peers that send from another public IP than at login, and resume them when they
+        send from that IP again, see wgauth.follow_endpoints. End the session of the peers whose key looks used by
+        two devices, see wgauth.CopyDetector.
+        """
+        strict = state["lock_endpoint"] == "strict"
+        if not strict and not state["detect_copies"]:
             return
         endpoints = wgauth.read_endpoints()
         if endpoints is None:
+            return
+        if strict:
+            wgauth.follow_endpoints(state, endpoints)
+        if not state["detect_copies"]:
             return
         keys = {peer["public_key"] for config in state["servers"].values() for peer in config["peers"].values()}
         watched = {key: address for key, address in endpoints.items() if key in keys}
@@ -418,6 +447,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def route(self):
         return self.path.split("?", 1)[0]
+
+    def query(self):
+        # the first value of each name; the empty ones count: an app without a device key sends device=
+        text = self.path.partition("?")[2]
+        return {name: values[0] for name, values in urllib.parse.parse_qs(text, keep_blank_values=True).items()}
 
     def send_json(self, status, data):
         body = json.dumps(data).encode()
@@ -453,7 +487,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.route() == "/api/status":
-            self.call(self.server.service.status)
+            self.call(self.server.service.status, self.query())
         else:
             self.send_json(404, {"error": "not_found"})
 
@@ -489,7 +523,7 @@ def monitor(service, stop):
     ticks = 0
     while not stop.wait(WATCH_INTERVAL):
         ticks += 1
-        run_logged(errors, "copy detection", lambda: service.watch(current_state()))
+        run_logged(errors, "endpoint check", lambda: service.watch(current_state()))
         if ticks % (SYNC_INTERVAL // WATCH_INTERVAL) == 0:
             # rebuilds the gate if it's missing, ends the sessions no longer valid
             run_logged(errors, "sync", lambda: sync(apply=False))
@@ -697,6 +731,21 @@ def status():
                     "expires": iso_time(now + left),
                 }
             )
+    # the peer sends from another public IP than at login, see wgauth.follow_endpoints
+    for server, entries in sorted(metadata.items()):
+        for address, entry in sorted(entries.items()):
+            if wgauth.is_paused(entry):
+                result.append(
+                    {
+                        "server": server,
+                        "address": address,
+                        "peer": entry.get("peer", ""),
+                        "user": entry.get("user", ""),
+                        "from": entry.get("endpoint", ""),
+                        "expires": iso_time(entry.get("expires", 0)),
+                        "paused": iso_time(entry["paused"]),
+                    }
+                )
     print(json.dumps({"sessions": result, "blocked_servers": gate["blocked"]}, indent=2))
 
 

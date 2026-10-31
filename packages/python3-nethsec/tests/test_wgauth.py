@@ -793,26 +793,100 @@ def test_endpoints(mocker):
     assert wgauth.read_endpoints() == {"KEY_A": "203.0.113.7", "KEY_C": "2001:db8::1"}
 
 
-def test_session_problem_endpoint(tmp_path):
+def test_endpoint_action(tmp_path):
+    state = wgauth.build_state(_setup_db(tmp_path))
+    entry = _session(state, endpoint="203.0.113.7")
+    paused = dict(entry, paused=int(time.time()))
+
+    def action(current, entry=entry, lock="strict"):
+        return wgauth.endpoint_action(dict(state, lock_endpoint=lock), entry, current)
+
+    assert action("203.0.113.7") is None
+    # the same key from another public IP: the session waits for the device of the login
+    assert action("198.51.100.20") == "pause"
+    assert action("198.51.100.20", paused) is None
+    assert action("203.0.113.7", paused) == "resume"
+    # the session follows the peer, or the lock is off: nothing paused, and what was paused resumes
+    for lock in ("roaming", "off"):
+        assert action("198.51.100.20", lock=lock) is None
+        assert action("198.51.100.20", paused, lock=lock) == "resume"
+    # unknown endpoint, for example after an interface restart
+    assert action(None) is None
+    assert action(None, paused) is None
+    # endpoint not recorded at login
+    assert action("198.51.100.20", _session(state)) is None
+    assert action("198.51.100.20", None) is None
+
+
+def test_session_problem_paused(tmp_path):
     state = wgauth.build_state(_setup_db(tmp_path))
     now = int(time.time())
-    entry = _session(state, endpoint="203.0.113.7")
 
-    def problem(endpoints, lock="strict"):
-        return wgauth.session_problem(dict(state, lock_endpoint=lock), "wg1", "10.103.1.2", entry, None, now, endpoints)
+    def problem(**changes):
+        entry = _session(state, endpoint="203.0.113.7", login=now - 60, expires=now + 3600)
+        entry.update(changes)
+        return wgauth.session_problem(state, "wg1", "10.103.1.2", entry, None, now)
 
-    assert problem({"KEY_ALICE": "203.0.113.7"}) is None
-    # the same key from another public IP
-    assert problem({"KEY_ALICE": "198.51.100.20"}) == "endpoint_changed"
-    # the session follows the peer
-    assert problem({"KEY_ALICE": "198.51.100.20"}, lock="roaming") is None
-    # unknown endpoint, for example after an interface restart
-    assert problem({}) is None
-    # check disabled
-    assert problem(None) is None
-    # endpoint not recorded at login
-    entry.pop("endpoint")
-    assert problem({"KEY_ALICE": "198.51.100.20"}) is None
+    assert problem(paused=now - 30) is None
+    # the device of the login didn't come back
+    assert problem(paused=now - wgauth.PAUSE_LIMIT - 1) == "endpoint_changed"
+    # a paused session has no nftables timeout
+    assert problem(paused=now - 30, expires=now - 1) == "expired"
+    # corrupted metadata isn't a pause
+    assert problem(paused="yesterday") is None
+    assert not wgauth.is_paused(_session(state, paused=True)) and not wgauth.is_paused(None)
+
+
+def test_follow_endpoints(tmp_path, mocker, run_dir):
+    u = _setup_db(tmp_path)
+    state = wgauth.build_state(u)
+    now = int(time.time())
+    fake = FakeCommands(
+        table=table_objects(["wg1", "wg4", "wg5"], {"wg1": {"10.103.1.2": 3000}}),
+        endpoints="wg1\tKEY_ALICE\t198.51.100.20:51820\n",
+    )
+    mocker.patch("nethsec.wgauth._run", fake)
+    log = mocker.patch("nethsec.wgauth.log")
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state, endpoint="203.0.113.7", expires=now + 3000)}})
+    # another device sends with the key: the peer is blocked again, its connections cut, the session kept
+    assert wgauth.follow_endpoints(state, wgauth.read_endpoints(), now) == [("wg1", "10.103.1.2", "pause")]
+    assert fake.scripts()[-1].splitlines() == [
+        "add element inet ns_wgauth auth_wg1 { 10.103.1.2 }",
+        "delete element inet ns_wgauth auth_wg1 { 10.103.1.2 }",
+    ]
+    assert ["conntrack", "-D", "-s", "10.103.1.2"] in fake.commands("conntrack")
+    assert wgauth.load_metadata()["wg1"]["10.103.1.2"]["paused"] == now
+    assert any("sends from 198.51.100.20, it logged in from 203.0.113.7" in call.args[0] for call in log.call_args_list)
+    # still there: nothing more to do
+    assert wgauth.follow_endpoints(state, wgauth.read_endpoints(), now + 5) == []
+    # only the session asked for
+    fake.endpoints = "wg1\tKEY_ALICE\t203.0.113.7:51820\n"
+    assert wgauth.follow_endpoints(state, wgauth.read_endpoints(), now + 10, only=("wg1", "10.103.1.9")) == []
+    # the device of the login sends again: the session goes on for the time it has left, no new login
+    assert wgauth.follow_endpoints(state, wgauth.read_endpoints(), now + 10, only=("wg1", "10.103.1.2")) == [
+        ("wg1", "10.103.1.2", "resume")
+    ]
+    assert fake.scripts()[-1] == "add element inet ns_wgauth auth_wg1 { 10.103.1.2 timeout 2990s }\n"
+    assert "paused" not in wgauth.load_metadata()["wg1"]["10.103.1.2"]
+    # expired while paused: left to reconcile
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state, endpoint="203.0.113.7", expires=now, paused=now)}})
+    assert wgauth.follow_endpoints(state, wgauth.read_endpoints(), now + 10) == []
+    # other keys now: the session belongs to the old ones, reconcile ends it
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state, public_key="OLD", endpoint="203.0.113.7")}})
+    fake.endpoints = "wg1\tKEY_ALICE\t198.51.100.20:51820\n"
+    assert wgauth.follow_endpoints(state, wgauth.read_endpoints(), now) == []
+
+
+def test_close_paused_session(tmp_path, mocker, run_dir):
+    state = wgauth.build_state(_setup_db(tmp_path))
+    fake = FakeCommands(table=table_objects(["wg1", "wg4", "wg5"]))
+    mocker.patch("nethsec.wgauth._run", fake)
+    mocker.patch("nethsec.wgauth.log")
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state, paused=int(time.time()))}})
+    # a paused session is a session: the administrator or the user can end it
+    assert wgauth.close_session("wg1", "10.103.1.2", "administrator")
+    assert wgauth.load_metadata() == {}
+    assert not wgauth.close_session("wg1", "10.103.1.2", "administrator")
 
 
 def test_reconcile_endpoint(tmp_path, mocker, run_dir):
@@ -827,13 +901,24 @@ def test_reconcile_endpoint(tmp_path, mocker, run_dir):
     mocker.patch("nethsec.wgauth._run", fake)
     log = mocker.patch("nethsec.wgauth.log")
     # the endpoint wasn't known at login: recorded now
-    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state)}})
+    wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state, expires=now + 3000)}})
     assert wgauth.reconcile(state) == []
     assert wgauth.load_metadata()["wg1"]["10.103.1.2"]["endpoint"] == "203.0.113.7"
-    # the same key from another public IP ends the session
+    # the same key from another public IP pauses the session, it keeps the IP of the login
     fake.endpoints = "wg1\tKEY_ALICE\t198.51.100.20:51820\n"
+    assert wgauth.reconcile(state) == []
+    entry = wgauth.load_metadata()["wg1"]["10.103.1.2"]
+    assert (entry["endpoint"], wgauth.is_paused(entry)) == ("203.0.113.7", True)
+    # a paused session has no element: it isn't taken for expired
+    fake.table = table_objects(["wg1", "wg4", "wg5"])
+    assert wgauth.reconcile(state) == []
+    # the device of the login never came back
+    entry["paused"] = now - wgauth.PAUSE_LIMIT - 1
+    wgauth.save_metadata({"wg1": {"10.103.1.2": entry}})
     assert wgauth.reconcile(state) == [("wg1", "10.103.1.2", "endpoint_changed")]
-    assert any("sends from 198.51.100.20, it logged in from 203.0.113.7" in call.args[0] for call in log.call_args_list)
+    assert any("didn't come back to 203.0.113.7" in call.args[0] for call in log.call_args_list)
+    assert wgauth.load_metadata() == {}
+    fake.table = table_objects(["wg1", "wg4", "wg5"], {"wg1": {"10.103.1.2": 3000}})
     # roaming: the session follows the peer
     wgauth.save_metadata({"wg1": {"10.103.1.2": _session(state, endpoint="203.0.113.7")}})
     u.set("ns-wgauth", "config", "lock_endpoint", "roaming")
@@ -1131,6 +1216,14 @@ def test_decode_public_key():
         assert wgauth.decode_public_key(base64.b64encode(bad).decode()) is None
     for bad in ("not base64!", "", None, 42):
         assert wgauth.decode_public_key(bad) is None
+
+
+def test_device_key_id():
+    # the same ID as the app computes, see device.rs in Authway
+    key = base64.b64encode(wgauth.P256_SPKI_PREFIX + bytes([4] * 65)).decode()
+    key_id = "4bc1fd1a02bd2365584af4f2ed045fad3e6e83d3ec744395310511277913ee7c"
+    assert wgauth.device_key_id(key) == key_id
+    assert wgauth.device_key_id("not a key") == "" and wgauth.device_key_id(None) == ""
 
 
 def test_challenges():

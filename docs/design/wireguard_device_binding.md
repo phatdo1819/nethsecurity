@@ -133,6 +133,29 @@ add megabytes for one function.
 The signature isn't a secret: it travels over the plain HTTP login inside the tunnel without harm, and the challenge
 stops a replay.
 
+### Another device with the configuration
+
+WireGuard knows a peer only by its key, so a second device with the same `.conf` completes the handshake: the
+firewall can't refuse it before the login. Its handshakes and keepalives take the endpoint of the peer, and the
+enrolled device loses the replies meanwhile. So the client of another device must step back at once, before any
+login:
+
+- The client asks `GET /api/status?device=<key ID>` right after the tunnel comes up, and then at every status. The
+  key ID is the SHA-256 of the DER public key of its device key for the peer, in lower-case hex
+  (`device_key_id` in `nethsec.wgauth`), empty when it has no key yet. Without the parameter, from the browser or an
+  older client, nothing changes.
+- When a device is enrolled, `device` also returns `"this_device": true` or `false`. With `false` the client takes
+  the tunnel down, says that the configuration is enrolled on another device, and doesn't reconnect until the user
+  turns it on again. The answer is a `device_mismatch` alert of the peer too, at most once an hour.
+- The firewall pauses the session of the peer as soon as the status comes from another public IP than the login,
+  see [lock_endpoint](wireguard_user_auth.md#sessions), and resumes it when the enrolled device sends again: its
+  user doesn't log in again, and the visit isn't counted as a copy (two endpoint changes, the copy detection needs
+  three).
+
+The key ID isn't a proof: a modified client can send the ID of the enrolled device, which is public. It gains
+nothing, the login still needs the signature, and the paused session doesn't come back until the IP of the login
+does. `this_device` only lets an honest client step back.
+
 Errors:
 
 - `403 {"error": "device_required"}`: no `device`, the browser for example. The login page explains it
