@@ -3,8 +3,10 @@
 > [!WARNING]
 > **This is a personal fork, and its changes are a proof of concept.** It isn't the official NethSecurity: Nethesis
 > didn't make or review these changes and doesn't support them. They were written by an AI (Claude, by Anthropic),
-> directed and tested by one person on test firewalls, and no security expert has reviewed them. Don't install the
-> images of this fork on a firewall you rely on. For the official firewall, see
+> directed and tested by one person on test firewalls, and no security expert has reviewed them. The WireGuard login
+> was tested in virtual machines only: a test firewall running this fork, with a Windows and a macOS virtual machine
+> as clients, on one local network; not on physical machines nor across the internet. Don't install the images of
+> this fork on a firewall you rely on. For the official firewall, see
 > [NethServer/nethsecurity](https://github.com/NethServer/nethsecurity).
 >
 > What the fork adds, each with a guide to test it:

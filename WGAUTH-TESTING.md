@@ -157,11 +157,11 @@ while the laptop is on Wi-Fi. The detection needs the two devices active at the 
 |---|---|
 | The copy, the owner logged out | The tunnel comes up, only the login page answers |
 | 5 wrong passwords from the copy | **Too many failed attempts** on the copy for 15 minutes. The owner, on the other network, can still log in. The peer shows a warning icon in the web UI: "locked out after too many failed logins from ..." |
-| The copy and the owner active at the same time, the owner logged in | Within a minute the owner loses the session (IP lock). Within about 2 minutes the peer shows a warning, "used from ... at the same time", and the log `possible copy of the configuration of peer ...` |
+| The copy and the owner active at the same time, the owner logged in | Within 5 seconds the session of the owner pauses (IP lock): the copy gets nothing. Stop the copy: the next packet of the owner resumes the session, no new login (`session paused` / `session resumed` in the log). Both kept active: within about 2 minutes the peer shows a warning, "used from ... at the same time", and the log `possible copy of the configuration of peer ...` |
 | The same, with `block_copies` set to `1` (see [Settings](#settings)) | The peer shows **Blocked**; the login page says the configuration is blocked, on both devices |
 | Peer menu > **Clear warnings** | The warnings go, a blocked peer can log in again |
 | Peer menu > **Generate new keys**, apply | The old configuration no longer connects, on any device; download the new one, the warnings are gone |
-| The owner changes network (Wi-Fi to 4G) | The session ends, log in again. With `lock_endpoint` set to `roaming` the session continues |
+| The owner changes network (Wi-Fi to 4G) | The session pauses and the login is asked again; after 5 minutes paused it ends. `ns-wgauth status` lists it with `paused` meanwhile. With `lock_endpoint` set to `roaming` the session continues |
 | Turn the tunnel off for 6 minutes | The session ends |
 | Change the password of `alice` and apply | The session ends. Before you apply, nothing changes: the old password still works |
 | Set the server to *WireGuard key*, save **without applying**, wait a minute | The LAN still needs the login. Apply: it doesn't anymore. Set it back to *Key, user password and OTP* and apply |
@@ -285,7 +285,8 @@ An older Authway gets **device required** on a bound server.
 | Open the login page in a browser | It says that only the VPN app on the enrolled device can log in; no form |
 | Authway: connect and log in | The window says the first login enrolls this computer. After the login the peer shows the name of the computer in **Device**; its tooltip shows when, from which IP, and the key `software` |
 | Disconnect, connect and log in again from the same computer | It works, without a new enrollment |
-| Import the same `.conf` in Authway on another computer, log in with the right password and code | **This VPN configuration is enrolled on another device**. The peer shows a warning, "login attempt from another device", once an hour at most. The password isn't even checked: 5 tries lock out that IP |
+| The first computer connected and logged in; import the same `.conf` in Authway on another computer and connect | Within a second or two, before any login, the other computer turns the VPN off and says **This VPN configuration is enrolled on another device**; it doesn't reconnect by itself. The first computer stays logged in: at most a few seconds without traffic, no new login. The log has `session paused` then `session resumed`, and `tried to connect from another device`; the peer shows a warning once an hour at most, and no "used at the same time" warning |
+| The same with an Authway older than this test, or the login typed fast | **This VPN configuration is enrolled on another device and works only there: your username and password weren't checked**. The password isn't even checked: 5 tries lock out that IP |
 | Peer menu > **Revoke device** | The session ends at once. Authway shows *no device enrolled*; the peer shows **No device**, and `ns-wgauth check` warns |
 | Peer menu > **Allow a new device**, then log in from the second computer | The second computer is enrolled; the first one is refused |
 | Remove the VPN from Authway, add it again, log in | Refused: removing a VPN deletes its key. Allow a new device first |
