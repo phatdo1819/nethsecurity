@@ -168,6 +168,8 @@ while the laptop is on Wi-Fi. The detection needs the two devices active at the 
 | A peer without a user | The peer shows **No user**; its login page says it isn't linked to a user |
 | Add a second peer for `alice` on the same server, or move another peer to `alice` | Refused: "This user already has a peer on this server". In the user list of the peer, `alice` is greyed out with "Has the peer ..." |
 | Peers that shared a user before this rule | The **User** column of each shows a warning with the other peers; `ns-wgauth check` warns too. They still log in: link each to its own user, or delete the extra ones |
+| **Users and objects > Users databases**: delete a user that has peers on the servers with login | The confirmation names its peers and their servers. After you apply, the peers are gone from those servers and their configurations no longer connect; the servers with *WireGuard key* only keep all their peers. A new user with the same name gets no peer |
+| A peer whose user was deleted before this image (or with `uci delete users.<id>`) | Its **User** column shows the name with a warning: "doesn't exist anymore". Create a user with that name: the peer shows **No user** instead, the new user doesn't get it |
 | Disable the peer, or **Log out** in the peer menu | The session ends |
 | The same OTP code used twice | The second login is refused |
 | `fw4 reload`, or edit another peer of the same server and apply | The session stays |
