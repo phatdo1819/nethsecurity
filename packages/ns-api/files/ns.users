@@ -11,7 +11,7 @@ import os
 import sys
 import json
 import subprocess
-from nethsec import utils, users, ovpn
+from nethsec import utils, users, ovpn, wgauth
 from euci import EUci
 
 def remove_vpn_access(u, user):
@@ -21,6 +21,29 @@ def remove_vpn_access(u, user):
         return
     for instance in ovpn.remove_user_access(u, user):
         print(f"Cannot revoke the certificate of {user['name']} on {instance}", file=sys.stderr)
+    remove_wireguard_peers(u, user['name'], user['database'])
+
+def remove_wireguard_peers(u, name, database):
+    # the WireGuard peers of a deleted user on the servers with the login are deleted too, applied with the user:
+    # a new user with the same name doesn't get them. A peer left behind can't log in anyway
+    try:
+        wgauth.remove_user_peers(u, name, database)
+    except Exception as e:
+        print(f"Cannot delete the WireGuard peers of {name}: {e}", file=sys.stderr)
+
+def find_stale_peers(u, name, database):
+    # the peers still linked to the name of a user deleted before: a new user with the name must not get them
+    try:
+        return wgauth.find_stale_links(u, name, database)
+    except Exception as e:
+        print(f"Cannot look for the WireGuard peers linked to {name}: {e}", file=sys.stderr)
+        return []
+
+def unlink_stale_peers(u, peers):
+    try:
+        wgauth.unlink_peers(u, peers)
+    except Exception as e:
+        print(f"Cannot unlink the WireGuard peers {', '.join(peers)}: {e}", file=sys.stderr)
 
 cmd = sys.argv[1]
 
@@ -64,7 +87,13 @@ else:
             users.edit_local_database(u, args['name'], args['description'])
             ret = {"result": "success"}
         elif action == "delete-local-database":
+            # the users of the database are deleted with it: their WireGuard peers too, as for delete-local-user
+            names = [u.get('users', s, 'name', default='') for s in utils.get_all_by_type(u, 'users', 'user') or {}
+                     if u.get('users', s, 'database', default='') == args['name']]
             users.delete_local_database(u, args['name'])
+            for name in names:
+                if name:
+                    remove_wireguard_peers(u, name, args['name'])
             ret = {"result": "success"}
 
         elif action == "add-ldap-database":
@@ -82,7 +111,10 @@ else:
             ret = {"users": users.list_remote_users(args['uri'], args['user_dn'], args['user_attr'], args['user_display_attr'], args['start_tls'], args['tls_reqcert'], args.get("bind_dn"), args.get("bind_password"), args.get("schema"))}
 
         elif action == "add-local-user":
+            # looked for before the user exists, unlinked once it's added
+            stale = find_stale_peers(u, args['name'], args['database'])
             ret = {"id": users.add_local_user(u, args['name'], args.get('password'), args.get('description',''), args['database'], args.get("extra"))}
+            unlink_stale_peers(u, stale)
         elif action == "edit-local-user":
             extra = args.get("extra")
             if not extra:

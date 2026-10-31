@@ -18,6 +18,7 @@ The login is enabled per server, in the network interface of a WireGuard server 
 
 Each peer of such a server is linked to a user with the `ns_user` option, one peer per user and server:
 `ns.wireguard` refuses a second one, and `ns-wgauth check` points out the peers that shared a user before the rule.
+Deleting the user with `ns.users` deletes its peers on these servers, as it revokes its OpenVPN certificates.
 With `key_password_otp` the OTP secret is
 the `openvpn_2fa` option of the user, the one used by OpenVPN Road Warrior. Removing the user's OpenVPN account
 deletes it: the user can't log in until the peer is saved again, which creates a new secret (`ns-wgauth check`
