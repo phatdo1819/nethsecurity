@@ -948,6 +948,11 @@ paths:
                               user:
                                 type: string
                                 description: Linked user, empty if none
+                              user_missing:
+                                type: boolean
+                                description: >-
+                                  The linked user doesn't exist in the users database of the server: the peer can't
+                                  log in
                               authenticated:
                                 type: boolean
                               auth_expires:
@@ -1259,6 +1264,59 @@ paths:
                   - $ref: "#/components/schemas/WireGuardResult"
                   - $ref: "#/components/schemas/ValidationError"
                   - $ref: "#/components/schemas/Error"
+  POST /ubus/ns.wireguard/list-user-peers:
+    post:
+      summary: List the peers linked to a user on the servers with the login
+      description: >-
+        The peers that ns.users delete-local-user deletes with the user: on the servers that require the login with
+        its users database. The servers with the WireGuard key only are not looked at.
+      operationId: ns.wireguard.list-user-peers
+      tags:
+        - wireguard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - user
+              properties:
+                user:
+                  type: string
+                  description: User name, compared ignoring the case
+                  example: john
+                database:
+                  type: string
+                  description: Users database, default main
+                  example: main
+      responses:
+        "200":
+          description: The peers of the user
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      peers:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                              example: wg1_ns_76e103f5_peer
+                            name:
+                              type: string
+                              example: John laptop
+                            server:
+                              type: string
+                              example: wg1
+                            server_name:
+                              type: string
+                              example: Road warriors
+                  - $ref: "#/components/schemas/ValidationError"
   POST /ubus/ns.wireguard/connection-history:
     post:
       summary: Read a page of the connection history of the peers of the servers

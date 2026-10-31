@@ -5965,6 +5965,9 @@ Response example:
 May raise the following validation errors:
 - db_not_found
 
+As for `delete-local-user`, the WireGuard peers of its users on the servers with the login that use the database are
+deleted.
+
 ### add-local-user
 
 Add a user to the local database:
@@ -5983,6 +5986,11 @@ May raise the following validation errors:
 - user_already_exists
 - db_not_local
 - invalid_name if `name` contains characters other than letters, digits, dots, underscores, at signs and hyphens
+
+The WireGuard peers still linked to the name, left by a user deleted before its peers were deleted with it, are
+unlinked: the new user doesn't get the peers, and the configurations, of the old one. On a server with the login, such
+a peer shows no user until it's linked again. Links kept by servers with the WireGuard key only are unlinked when no
+database has a user with the name.
 
 ### edit-local-user
 
@@ -6018,6 +6026,10 @@ Response example:
 May raise the following validation errors:
 - user_not_found
 - db_not_local
+
+The WireGuard peers linked to the user on the servers that require the login with its database are deleted too,
+see `ns.wireguard list-user-peers`: their configurations stop working, and a new user with the same name doesn't get
+them. The change is saved with the deletion of the user and applied by the same commit.
 
 ### add-remote-user
 
@@ -6072,6 +6084,9 @@ Response example:
 May raise the following validation errors:
 - user_not_found
 - db_not_remote
+
+As for `delete-local-user`, the WireGuard peers of the user on the servers with the login that use the database are
+deleted.
 
 ### set-admin
 
@@ -8621,6 +8636,7 @@ Response example:
           "reserved_ip": "10.1.122.2",
           "config": "[Interface]\n# Name = iPhone di Tommaso\n# Login = http://10.1.122.1:8181/\nPrivateKey = XXX\nAddress = 10.1.122.2\n# DNS not configured\n\n[Peer]\n# Name = HQ\nPublicKey = XXX\nPresharedKey = XXX\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = 127.0.0.1:51820\nPersistentKeepalive = 25\n",
           "user": "tommaso",
+          "user_missing": false,
           "authenticated": true,
           "auth_expires": "2025-09-30T16:52:29+00:00",
           "blocked": false,
@@ -8662,6 +8678,8 @@ Login fields of a server:
 
 Login fields of a peer:
 - `user`: the linked user, empty if there is none
+- `user_missing`: `true` if the linked user doesn't exist in the users database of the server: the peer can't log in
+  until it's linked to another user. Creating a user with that name unlinks the peer, see `ns.users add-local-user`
 - `authenticated`: `true` while the user is logged in
 - `auth_expires`: when the session ends, only if `authenticated` is `true`
 - `blocked`: `true` if the peer is blocked after a suspected copy of its configuration (`block_copies` in
@@ -8913,6 +8931,30 @@ Response example:
 ```
 
 Errors: validation error `id` `required`, `invalid` or `device_binding_not_required`, error `device_revoke_failed`.
+
+### list-user-peers
+
+List the peers linked to a user on the servers that require the login with its users database: the peers that
+`ns.users delete-local-user` deletes with the user. The servers with the WireGuard key only don't use the link, their
+peers are not listed:
+```
+api-cli ns.wireguard list-user-peers --data '{"user": "john", "database": "main"}'
+```
+
+Parameters:
+- `user`: the user name, compared ignoring the case as the login does
+- `database` (optional): the users database, default `main`
+
+Response example:
+```json
+{
+  "peers": [
+    {"id": "wg1_ns_76e103f5_peer", "name": "John laptop", "server": "wg1", "server_name": "Road warriors"}
+  ]
+}
+```
+
+Errors: validation error `user` `required`, `database` `required`.
 
 
 ### list-tunnels

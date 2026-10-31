@@ -269,6 +269,75 @@ def test_peers_by_user(tmp_path):
     assert wgauth.peers_by_user(u, "wg1")["alice"] == [ALICE, "wg1_ns_eeeeeeee_peer"]
 
 
+def test_list_user_peers(tmp_path):
+    u = _setup_db(tmp_path)
+    u.set("network", ALICE, "ns_name", "alice-laptop")
+    # on every server with the login and the database of the user, ignoring the case
+    assert wgauth.list_user_peers(u, "ALICE", "wgauth_users") == [
+        {"id": ALICE, "name": "alice-laptop", "server": "wg1", "server_name": "Road warriors"},
+        {"id": "wg4_ns_dddddddd_peer", "name": "wg4_ns_dddddddd_peer", "server": "wg4", "server_name": "wg4"},
+    ]
+    # another database
+    assert wgauth.list_user_peers(u, "alice", "wgauth_ldap") == []
+    # the servers with the key only don't use the link
+    u.set("network", "wg2_ns_cccccccc_peer", "ns_user", "carol")
+    assert wgauth.list_user_peers(u, "carol", "wgauth_users") == []
+
+
+def test_remove_user_peers(tmp_path):
+    u = _setup_db(tmp_path)
+    removed = wgauth.remove_user_peers(u, "alice", "wgauth_users")
+    assert [peer["id"] for peer in removed] == [ALICE, "wg4_ns_dddddddd_peer"]
+    assert u.get("network", ALICE, default=None) is None
+    assert u.get("network", "wg4_ns_dddddddd_peer", default=None) is None
+    # the others stay
+    assert u.get("network", "wg1_ns_bbbbbbbb_peer") == "wireguard_wg1"
+    assert u.get("network", "wg1_ns_eeeeeeee_peer") == "wireguard_wg1"
+    # saved: another reader sees it
+    other = EUci(confdir=tmp_path.joinpath("config").as_posix(), savedir=tmp_path.joinpath("save").as_posix())
+    assert other.get("network", ALICE, default=None) is None
+    # nothing to remove
+    assert wgauth.remove_user_peers(u, "nobody", "wgauth_users") == []
+
+
+def test_remove_user_peers_key_servers(tmp_path):
+    u = _setup_db(tmp_path)
+    # links kept by a server switched to the WireGuard key only, waiting for the login to be turned on again
+    u.set("network", "wg2_ns_cccccccc_peer", "ns_user", "carol")
+    u.set("users", "ns_wgcarol2", "user")
+    u.set("users", "ns_wgcarol2", "name", "carol")
+    u.set("users", "ns_wgcarol2", "database", "wgauth_ldap")
+    # carol is deleted from one database but has a user in another one: the link stays
+    u.delete("users", "ns_wgcarol")
+    assert wgauth.remove_user_peers(u, "carol", "wgauth_users") == []
+    assert u.get("network", "wg2_ns_cccccccc_peer", "ns_user") == "carol"
+    # no carol anywhere: the link goes, the peer stays
+    u.delete("users", "ns_wgcarol2")
+    assert wgauth.remove_user_peers(u, "carol", "wgauth_ldap") == []
+    assert u.get("network", "wg2_ns_cccccccc_peer", "ns_user", default=None) is None
+    assert u.get("network", "wg2_ns_cccccccc_peer") == "wireguard_wg2"
+
+
+def test_find_stale_links(tmp_path):
+    u = _setup_db(tmp_path)
+    assert wgauth.user_names(u, "wgauth_users") == {"alice", "carol"}
+    assert wgauth.user_names(u) == {"alice", "carol"}
+    # bob doesn't exist: his peer on wg1 is a stale link, a new bob would get it
+    assert wgauth.find_stale_links(u, "Bob", "wgauth_users") == ["wg1_ns_bbbbbbbb_peer"]
+    # alice exists: her links are hers
+    assert wgauth.find_stale_links(u, "alice", "wgauth_users") == []
+    # another database: the servers of wgauth_users are not looked at
+    assert wgauth.find_stale_links(u, "bob", "wgauth_ldap") == []
+    # a link kept on a server with the key only
+    u.set("network", "wg2_ns_cccccccc_peer", "ns_user", "BOB")
+    assert wgauth.find_stale_links(u, "bob", "wgauth_users") == ["wg1_ns_bbbbbbbb_peer", "wg2_ns_cccccccc_peer"]
+    wgauth.unlink_peers(u, ["wg1_ns_bbbbbbbb_peer", "wg2_ns_cccccccc_peer"])
+    assert wgauth.find_stale_links(u, "bob", "wgauth_users") == []
+    assert wgauth.peers_by_user(u, "wg1") == {"alice": [ALICE]}
+    # the peers stay
+    assert u.get("network", "wg1_ns_bbbbbbbb_peer") == "wireguard_wg1"
+
+
 def test_build_state(tmp_path):
     u = _setup_db(tmp_path)
     state = wgauth.build_state(u)

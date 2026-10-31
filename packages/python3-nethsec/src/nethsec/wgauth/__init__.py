@@ -400,6 +400,127 @@ def peers_by_user(uci, server):
     return result
 
 
+def list_user_peers(uci, name, database):
+    """
+    List the peers linked to a user on the servers that require the login with its users database.
+
+    The servers with the WireGuard key only don't use the link, their peers are not listed.
+
+    Arguments:
+      - uci -- EUci pointer
+      - name -- user name, compared ignoring the case as the login does
+      - database -- users database of the user
+
+    Returns:
+      - a list of `{"id", "name", "server", "server_name"}`: the peer section and name, the server interface and name
+    """
+    result = []
+    for server in list_gated_servers(uci):
+        if uci.get("network", server, "ns_user_db", default="") != database:
+            continue
+        for peer in peers_by_user(uci, server).get(name.lower(), []):
+            result.append(
+                {
+                    "id": peer,
+                    "name": uci.get("network", peer, "ns_name", default=peer),
+                    "server": server,
+                    "server_name": uci.get("network", server, "ns_name", default=server),
+                }
+            )
+    return result
+
+
+def remove_user_peers(uci, name, database):
+    """
+    Delete the peers linked to a user that is deleted, like its OpenVPN accounts: their configurations stop working,
+    and a new user with the same name doesn't get them. The links to the name left on the servers with the WireGuard
+    key only are removed too, see `find_stale_links`. Call it once the user is deleted. The changes are saved, not
+    committed.
+
+    Arguments:
+      - uci -- EUci pointer
+      - name -- user name
+      - database -- users database of the user
+
+    Returns:
+      - the deleted peers, see `list_user_peers`
+    """
+    peers = list_user_peers(uci, name, database)
+    for peer in peers:
+        uci.delete("network", peer["id"])
+    if peers:
+        uci.save("network")
+    unlink_peers(uci, find_stale_links(uci, name, database))
+    return peers
+
+
+def user_names(uci, database=None):
+    """
+    Return the names of the users of a database, or of all the databases.
+
+    Arguments:
+      - uci -- EUci pointer
+      - database -- users database, None for all of them
+
+    Returns:
+      - a set of user names in lowercase, as the login compares them
+    """
+    return {
+        options.get("name", "").lower()
+        for options in (utils.get_all_by_type(uci, "users", "user") or {}).values()
+        if database is None or options.get("database", "") == database
+    }
+
+
+def find_stale_links(uci, name, database):
+    """
+    Find the peers still linked to a name that has no user: left by a user deleted before its peers were deleted with
+    it, or by hand. A new user with that name would get them, and with them the configuration that may still be on the
+    device of the old one.
+
+    - on the servers that require the login with `database`: the peers linked to `name` if `database` has no such user
+    - on the servers with the WireGuard key only, whose links wait for the login to be turned on again: the peers
+      linked to `name` if no database has such a user. A link to a user with the same name in another database stays.
+
+    Arguments:
+      - uci -- EUci pointer
+      - name -- user name, compared ignoring the case
+      - database -- users database
+
+    Returns:
+      - a sorted list of peer sections
+    """
+    key = name.lower()
+    in_database = key in user_names(uci, database)
+    anywhere = key in user_names(uci)
+    result = []
+    for server in uci.get("network"):
+        if not is_server(uci, server):
+            continue
+        if is_gated(uci, server):
+            if in_database or uci.get("network", server, "ns_user_db", default="") != database:
+                continue
+        elif anywhere:
+            continue
+        result.extend(peers_by_user(uci, server).get(key, []))
+    return sorted(result)
+
+
+def unlink_peers(uci, peers):
+    """
+    Remove the user of peers: on a server that requires the login, a peer without a user can't log in until it's
+    linked again. The changes are saved, not committed.
+
+    Arguments:
+      - uci -- EUci pointer
+      - peers -- peer sections
+    """
+    for peer in peers:
+        uci.delete("network", peer, "ns_user")
+    if peers:
+        uci.save("network")
+
+
 def get_peer_user(uci, server, peer):
     """
     Return the user linked to a peer.

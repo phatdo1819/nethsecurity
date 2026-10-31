@@ -860,6 +860,9 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts, devices)
     sessions = gate['sessions']
     server_sessions = sessions.get(instance, {})
     now = datetime.now(timezone.utc).timestamp()
+    # the users the peers can log in as: a peer linked to a missing one can't
+    user_db = u.get('network', instance, 'ns_user_db', default='')
+    db_users = wgauth.user_names(u, user_db) if gated and users.get_database_type(u, user_db) == 'local' else set()
 
     # Build peers list
     peers = []
@@ -882,6 +885,7 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts, devices)
             "user": u.get('network', p, 'ns_user', default=''),
             "authenticated": gated and reserved_ip in server_sessions,
         }
+        peer["user_missing"] = gated and peer["user"] != '' and peer["user"].lower() not in db_users
         if peer["authenticated"]:
             peer["auth_expires"] = datetime.fromtimestamp(now + server_sessions[reserved_ip], tz=timezone.utc).isoformat()
         public_key = u.get('network', p, 'public_key', dtype=str, default='')
@@ -1222,6 +1226,16 @@ def clear_peer_alerts(args):
     return {"result": "success"}
 
 
+def list_user_peers(args):
+    # the peers that ns.users deletes with the user, for the confirmation
+    if not isinstance(args.get('user'), str) or args['user'] == '':
+        return utils.validation_error('user', 'required')
+    database = args.get('database', 'main')
+    if not isinstance(database, str) or database == '':
+        return utils.validation_error('database', 'required')
+    return {"peers": wgauth.list_user_peers(EUci(), args['user'], database)}
+
+
 def __get_device_peer(e_uci, args):
     """Return the server of the peer in args['id'] if it requires device binding, or a validation error."""
     instance, err = __get_server_peer(e_uci, args)
@@ -1415,6 +1429,7 @@ if cmd == 'list':
         "clear-peer-alerts": {"id": "peerid"},
         "allow-device-enrollment": {"id": "peerid", "hours": 72},
         "revoke-device": {"id": "peerid"},
+        "list-user-peers": {"user": "john", "database": "main"},
         "list-tunnels": {},
         "add-tunnel": {
             "enabled": True,
@@ -1506,6 +1521,9 @@ else:
     elif action == 'revoke-device':
         args = json.loads(sys.stdin.read())
         ret = revoke_device(args)
+    elif action == 'list-user-peers':
+        args = json.loads(sys.stdin.read())
+        ret = list_user_peers(args)
     elif action == 'list-tunnels':
         ret = {"tunnels": list_tunnels()}
     elif action == 'add-tunnel':

@@ -118,6 +118,16 @@ are linked to their own users or deleted. Turning the login on again for a serve
 before isn't refused, for the same reason: the users can only be changed while the login is required.
 Each peer logs in separately. A peer without a user, or linked to a user that doesn't exist anymore, can't log in.
 
+Deleting a user deletes its peers on the gated servers that use its database, as it revokes its OpenVPN
+certificates: its configurations stop working, and a new user with the same name, for example a new employee with
+the name of a former one, doesn't get the old peer and so the configuration that may still be on the old laptop. The
+peers on the servers with the WireGuard key only stay: those servers don't use the link, but keep it for when the
+login is turned on again, so it's removed if no database has a user with that name anymore.
+
+The links are names, so the same rule is enforced when a user is created: the peers still linked to its name, left by
+a user deleted before this rule or by hand, are unlinked (`nethsec.wgauth.find_stale_links`). On a gated server they
+show no user; `list-servers` reports a link to a missing user with `user_missing` until then, and the UI shows it.
+
 ### Users
 
 No new options. With `key_password_otp` the OTP secret is the user's `openvpn_2fa` option, the one used by
@@ -444,7 +454,8 @@ The firewall can sit behind a router that forwards the WireGuard UDP port to it,
   current one. Validation errors: `user` `required`, `user_not_found`, `user_has_peer` (another peer of the server
   has this user, see above); `remote_networks` `not_allowed`.
 - `list-servers`: servers also return `auth_mode`, `user_db`, `auth_timeout`, `login_url`, `auth_enforced` and
-  `auth_blocked`; peers also return `user`, `authenticated`, `auth_expires`, `blocked` and `alerts` (newest first,
+  `auth_blocked`; peers also return `user`, `user_missing` (the linked user doesn't exist in the database of the
+  server), `authenticated`, `auth_expires`, `blocked` and `alerts` (newest first,
   `{"time": "...", "type": "copy" | "lockout", "addresses": ["198.51.100.20"]}`).
 - new `logout-peer` (`{"id": "wg1_ns_1234abcd_peer"}`): ends the peer's session. It changes no UCI option,
   so there is nothing to commit.
@@ -454,15 +465,21 @@ The firewall can sit behind a router that forwards the WireGuard UDP port to it,
   a new pre-shared key if it has one. The change is saved, to be applied with `ns.commit`.
 - new `clear-peer-alerts` (`{"id": "wg1_ns_1234abcd_peer"}`): forgets the alerts of the peer and unblocks it. Like
   `logout-peer`, it changes no UCI option.
+- new `list-user-peers` (`{"user": "john", "database": "main"}`): the peers of a user on the gated servers with its
+  database, `[{"id", "name", "server", "server_name"}]`, the ones `ns.users` deletes with the user. The UI names them
+  when it asks to confirm the deletion of a user.
 - the peer configuration gets the `# Login = ...` comment on gated servers.
 
 The ACL `ns.wireguard.json` already allows every method of `ns.wireguard`.
 
 ### ns.users
 
-No changes. Deleting a user, or changing its password, ends its sessions at the next `sync`, run by the procd
-trigger on the `users` configuration. The peers linked to a deleted user stay, but can't log in until they are
-linked to another user.
+`delete-local-user` and `delete-remote-user` also delete the peers of the user on the gated servers with its
+database (`nethsec.wgauth.remove_user_peers`, see [Peer](#peer)), and `delete-local-database` the peers of each of
+its users. `add-local-user` unlinks the peers still linked to the name of the new user. The changes are saved with
+the user and applied by the same `ns.commit`; if they fail, the user is deleted or added anyway and the error is
+logged, as a peer can't log in without its user. Deleting a user, or changing its password, ends its sessions at the
+next `sync`, run by the procd trigger on the `users` configuration.
 
 ## Packaging
 
