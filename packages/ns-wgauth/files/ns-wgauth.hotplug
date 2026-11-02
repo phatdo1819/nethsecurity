@@ -1,0 +1,12 @@
+#!/bin/sh
+
+#
+# Copyright (C) 2026 Nethesis S.r.l.
+# SPDX-License-Identifier: GPL-2.0-only
+#
+
+# An interface that comes up has the WireGuard keys of the configuration: put back the keys the enrolled devices
+# gave their peers, see nethsec.wgauth.apply_device_keys
+[ "$ACTION" = "ifup" ] || exit 0
+grep -q '"wireguard_key"' /etc/ns-wgauth/devices.json 2>/dev/null || exit 0
+/usr/sbin/ns-wgauth keys "$INTERFACE" | logger -t ns-wgauth

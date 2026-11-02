@@ -14,7 +14,7 @@ import subprocess
 import syslog
 
 from euci import EUci
-from nethsec import wghistory
+from nethsec import wgauth, wghistory
 
 
 def main():
@@ -29,9 +29,19 @@ def main():
     except (OSError, subprocess.CalledProcessError):
         # no WireGuard interface: the open connections end
         dump = ""
+    # a peer whose enrolled device gave it a WireGuard key of its own keeps its history, see nethsec.wgauth
+    keys = wgauth.device_wireguard_keys(wgauth.load_devices())
+    peers = {}
+    for (interface, public_key), status in wghistory.parse_dump(dump).items():
+        peers.setdefault(interface, {})[public_key] = status
+    peers = {
+        (interface, public_key): status
+        for interface, by_key in peers.items()
+        for public_key, status in wgauth.to_peer_keys(by_key, keys).items()
+    }
     conn = wghistory.connect(path)
     try:
-        wghistory.record(conn, wghistory.parse_dump(dump), configured)
+        wghistory.record(conn, peers, configured)
     finally:
         conn.close()
 

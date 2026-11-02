@@ -20,6 +20,7 @@ Usage: ns-wgauth COMMAND
   alerts          print the suspected copies and the lockouts of the peers as JSON
   clear PEER      forget the alerts of a peer and unblock it
   devices         print the devices enrolled and the enrollments open as JSON
+  keys [SERVER]   put on the interfaces the WireGuard keys of the enrolled devices, run when an interface comes up
 """
 
 import ipaddress
@@ -51,6 +52,9 @@ WATCH_INTERVAL = 5
 SYNC_INTERVAL = 15
 MAX_BODY = 4096
 OTP_REUSE_WINDOW = 120
+# seconds between the answer to a device that gives its peer a WireGuard key and the switch of the key: the answer
+# goes back through the tunnel of the old key
+KEY_SWITCH_DELAY = 1
 
 # the limit counts the requests of a VPN address, shared by every copy of a configuration: it only stops floods,
 # the failed logins are counted by the daemon for each public IP
@@ -79,6 +83,14 @@ server {{
 	}}
 
 	location = /api/login {{
+		limit_req zone=ns_wgauth burst=10 nodelay;
+		limit_req_status 429;
+		proxy_set_header X-Real-IP $remote_addr;
+		proxy_set_header X-Forwarded-Host $http_host;
+		proxy_pass http://unix:{socket};
+	}}
+
+	location = /api/device-key {{
 		limit_req zone=ns_wgauth burst=10 nodelay;
 		limit_req_status 429;
 		proxy_set_header X-Real-IP $remote_addr;
@@ -197,6 +209,8 @@ def sync(apply=True):
         update_nginx(state)
         # opens the enrollment of the new peers of the servers that require device binding
         wgauth.sync_devices(state)
+        # a restart of an interface sets the keys of the configuration again
+        wgauth.apply_device_keys(state)
         wgauth.reconcile(state)
     return state
 
@@ -209,6 +223,7 @@ class LoginService:
         self.failures = wgauth.LoginFailures()
         self.detector = wgauth.CopyDetector()
         self.challenges = wgauth.Challenges()
+        self.switch_delay = KEY_SWITCH_DELAY
         # peer -> time of the latest alert for a login from another device
         self.mismatches = {}
         # (database, user) -> {code: timestamp}, an OTP code works only once
@@ -236,6 +251,8 @@ class LoginService:
         The state of the peer that asks. The app of a device sends `device`, the ID of its device key for the peer, see
         wgauth.device_key_id, empty when it has none: with device binding, `this_device` tells it whether it's the
         enrolled device, so another one disconnects before its handshakes take the session of the enrolled one.
+        `wireguard_key` tells the enrolled device whether the peer still uses the key of its configuration file, see
+        `device_key`.
         """
         state = current_state()
         server, peer = self.target(state, address, host)
@@ -267,6 +284,9 @@ class LoginService:
                 "machine_id": config["machine_id"],
                 "challenge": self.challenges.issue(address, now),
             }
+            if device_state == "enrolled":
+                own_key = entry["device"].get("wireguard_key")
+                result["device"]["wireguard_key"] = "device" if own_key else "configuration"
             key_id = (query or {}).get("device")
             if key_id is not None and device_state == "enrolled":
                 this_device = key_id != "" and key_id == wgauth.device_key_id(entry["device"].get("key"))
@@ -400,6 +420,47 @@ class LoginService:
         wgauth.close_session(server, address, "logout")
         return 200, {"result": "success"}
 
+    def device_key(self, address, host, data):
+        """
+        The enrolled device, logged in, gives its peer a WireGuard key of its own, see wgauth.verify_wireguard_key:
+        the configuration file, and every copy of it, no longer connects. The key switches on the interface right
+        after the answer, so the device switches too, and connects again with its new key.
+        """
+        state = current_state()
+        server, peer = self.target(state, address, host)
+        if server is None:
+            return 403, {"error": "forbidden"}
+        if not state["servers"][server]["device_binding"]:
+            return 403, {"error": "device_binding_not_required"}
+        if wgauth.is_blocked(peer):
+            return 403, {"error": "blocked"}
+        if address not in wgauth.list_sessions().get(server, {}):
+            return 401, {"error": "not_authenticated"}
+        now = int(time.time())
+        if not self.challenges.use(address, data.get("challenge"), now):
+            return 401, {"error": "challenge_expired"}
+        entry = wgauth.peer_device(wgauth.load_devices(), peer["peer"], peer["public_key"])
+        error, wireguard_key = wgauth.verify_wireguard_key(state, server, address, peer, entry, data)
+        if error is None and not wgauth.set_device_wireguard_key(peer, entry["device"]["key"], wireguard_key, now):
+            # another device enrolled meanwhile
+            error = "device_not_enrolled"
+        if error is not None:
+            wgauth.log(
+                f"device key refused: peer={peer['peer']} user={peer['user']} address={address} reason={error}",
+                syslog.LOG_WARNING,
+            )
+            return (400 if error == "invalid_key" else 409 if error == "key_in_use" else 403), {"error": error}
+        timer = threading.Timer(self.switch_delay, self.switch_keys, args=(server,))
+        timer.daemon = True
+        timer.start()
+        return 200, {"result": "success"}
+
+    def switch_keys(self, server):
+        try:
+            wgauth.apply_device_keys(current_state(), only=server)
+        except Exception as error:  # noqa: BLE001 the daemon checks the keys again at every sync
+            wgauth.log(f"cannot switch the WireGuard keys of {server}: {error}", syslog.LOG_ERR)
+
     def watch(self, state):
         """
         Pause the sessions of the peers that send from another public IP than at login, and resume them when they
@@ -492,7 +553,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "not_found"})
 
     def do_POST(self):
-        methods = {"/api/login": self.server.service.login, "/api/logout": self.server.service.logout}
+        methods = {
+            "/api/login": self.server.service.login,
+            "/api/logout": self.server.service.logout,
+            "/api/device-key": self.server.service.device_key,
+        }
         method = methods.get(self.route())
         if method is None:
             self.send_json(404, {"error": "not_found"})
@@ -663,6 +728,7 @@ def check():
     report("OK" if service_listening() else "ERROR", f"the login service answers on {SOCKET}")
     endpoints = wgauth.read_endpoints() or {}
     stored_devices = wgauth.load_devices()
+    pending_keys = wgauth.apply_device_keys(state, dry_run=True)
     for server in servers:
         by_address = {}
         by_user = {}
@@ -674,6 +740,24 @@ def check():
                 report("ERROR", f"the public key of {server} is unknown: its devices can't log in")
             else:
                 report("OK", f"{server} requires device binding" + (" and machine IDs" if config["machine_id"] else ""))
+            own_keys = [
+                peer
+                for peer in config["peers"].values()
+                if wgauth.peer_wireguard_key(stored_devices, peer) != peer["public_key"]
+            ]
+            if own_keys:
+                report(
+                    "OK",
+                    f"peers of {server} with the WireGuard key of their device: {len(own_keys)}, their configuration "
+                    "files no longer connect",
+                )
+            for pending_server, peer, kind in pending_keys:
+                if pending_server == server:
+                    report(
+                        "WARNING",
+                        f"peer {peer} of {server} should connect with the WireGuard key of its {kind}, the interface has "
+                        "another one: run ns-wgauth keys",
+                    )
         for peer in config["peers"].values():
             if config["device_binding"] and peer["user"]:
                 entry = wgauth.peer_device(stored_devices, peer["peer"], peer["public_key"])
@@ -788,8 +872,17 @@ def devices():
                 last_used=iso_time(device.get("last_used", 0)),
                 **{"from": device.get("endpoint", "")},
             )
+            # the WireGuard key the peer connects with, see wgauth.set_device_wireguard_key
+            item["wireguard_key"] = "device" if device.get("wireguard_key") else "configuration"
+            if device.get("wireguard_key"):
+                item["wireguard_key_set"] = iso_time(device.get("wireguard_key_set", 0))
         result[peer] = item
     print(json.dumps(result, indent=2))
+
+
+def keys(server=None):
+    for changed_server, peer, kind in wgauth.apply_device_keys(current_state(), only=server):
+        print(f"{peer} of {changed_server}: the WireGuard key of its {kind}")
 
 
 def main():
@@ -813,6 +906,8 @@ def main():
             print(f"{sys.argv[2]} has no alerts", file=sys.stderr)
     elif command == "devices":
         devices()
+    elif command == "keys" and len(sys.argv) <= 3:
+        keys(sys.argv[2] if len(sys.argv) == 3 else None)
     else:
         print(__doc__.strip(), file=sys.stderr)
         sys.exit(2)

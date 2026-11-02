@@ -66,9 +66,12 @@ define Package/ns-wgauth/install
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_DIR) $(1)/www-wgauth
 	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
 	$(INSTALL_BIN) ./files/ns-wgauth.py $(1)/usr/sbin/ns-wgauth
 	$(INSTALL_CONF) ./files/config $(1)/etc/config/ns-wgauth
 	$(INSTALL_BIN) ./files/ns-wgauth.init $(1)/etc/init.d/ns-wgauth
+	# puts back the WireGuard keys of the enrolled devices when a server interface comes up
+	$(INSTALL_DATA) ./files/ns-wgauth.hotplug $(1)/etc/hotplug.d/iface/90-ns-wgauth
 	$(INSTALL_DATA) ./files/www/index.html ./files/www/app.js ./files/www/style.css $(1)/www-wgauth
 	$(INSTALL_DATA) ./files/www/manifest.json ./files/www/icon.svg $(1)/www-wgauth
 	$(INSTALL_DATA) ./files/www/icon-192.png ./files/www/icon-512.png $(1)/www-wgauth

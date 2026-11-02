@@ -225,7 +225,9 @@ def __active_peers():
     except:
         pass
 
-    return peers_status
+    # a peer whose enrolled device gave it a WireGuard key of its own, see nethsec.wgauth, is known by the key of
+    # its configuration
+    return wgauth.to_peer_keys(peers_status, wgauth.device_wireguard_keys(wgauth.load_devices()))
 
 
 def __list_peers(interface):
@@ -829,7 +831,11 @@ def __get_peer_device(devices, peer, public_key):
             "enrolled": __iso_time(device.get('enrolled', 0)),
             "last_used": __iso_time(device.get('last_used', 0)),
             "from": device.get('endpoint', ''),
+            # the device gave the peer a WireGuard key of its own: the configuration file no longer connects
+            "wireguard_key": "device" if device.get('wireguard_key') else "configuration",
         })
+        if device.get('wireguard_key'):
+            ret["wireguard_key_set"] = __iso_time(device.get('wireguard_key_set', 0))
     return ret
 
 
@@ -1246,13 +1252,25 @@ def __get_device_peer(e_uci, args):
     return instance, None
 
 
+def __restore_keys(instance):
+    """Without a device, the peer connects with the key of its configuration again: at once, not at the next check."""
+    state = wgauth.load_state()
+    if state is None:
+        return
+    try:
+        wgauth.apply_device_keys(state, only=instance)
+    except (OSError, RuntimeError):
+        # the login service checks the keys again within seconds
+        pass
+
+
 def allow_device_enrollment(args):
     """
     Forget the device of a peer and let a new one enroll at its next login, for example after a reinstall: the
     enrollment works at once, like logout-peer, without applying the changes.
     """
     e_uci = EUci()
-    _instance, err = __get_device_peer(e_uci, args)
+    instance, err = __get_device_peer(e_uci, args)
     if err:
         return err
     hours = args.get('hours', wgauth.DEFAULT_ENROLL_WINDOW // 3600)
@@ -1263,6 +1281,8 @@ def allow_device_enrollment(args):
         until = wgauth.allow_enrollment(args['id'], public_key, hours * 3600)
     except (OSError, RuntimeError):
         return utils.generic_error('device_enrollment_failed')
+    # the new device enrolls with the configuration file
+    __restore_keys(instance)
     return {"result": "success", "enrollment_until": __iso_time(until)}
 
 
@@ -1280,6 +1300,7 @@ def revoke_device(args):
             wgauth.close_session(instance, address, 'device_revoked')
     except (OSError, RuntimeError, ValueError):
         return utils.generic_error('device_revoke_failed')
+    __restore_keys(instance)
     return {"result": "success"}
 
 

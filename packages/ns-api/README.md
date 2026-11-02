@@ -8690,8 +8690,10 @@ Login fields of a peer:
 - `device`: only on a server with `device_binding`. `state` is `enrolled`, `waiting` (a device can enroll until
   `enrollment_until`) or `closed` (none can: see `allow-device-enrollment`). Once enrolled also `name` (the name the
   device gave), `kind` (`software`: where the device keeps its key), `machine_id` (`true` if its machine ID is
-  recorded), `enrolled`, `last_used` and `from` (the public IP of its latest login), for example:
-  `{"state": "enrolled", "name": "LAPTOP-42", "kind": "software", "machine_id": false, "enrolled": "2025-09-29T08:00:00+00:00", "last_used": "2025-09-30T08:52:29+00:00", "from": "203.0.113.7"}`
+  recorded), `enrolled`, `last_used`, `from` (the public IP of its latest login) and `wireguard_key`: `device` once
+  the device gave the peer a WireGuard key of its own, with `wireguard_key_set`, so the configuration file no longer
+  connects, else `configuration`. For example:
+  `{"state": "enrolled", "name": "LAPTOP-42", "kind": "software", "machine_id": false, "enrolled": "2025-09-29T08:00:00+00:00", "last_used": "2025-09-30T08:52:29+00:00", "from": "203.0.113.7", "wireguard_key": "device", "wireguard_key_set": "2025-09-29T08:00:05+00:00"}`
 
 Device fields of a server:
 - `device_binding`: `true` if the peers must log in from their enrolled device
@@ -8900,7 +8902,9 @@ Errors: validation error `id` `required` or `invalid`, error `clear_alerts_faile
 ### allow-device-enrollment
 
 On a server with `device_binding`, forget the device of a peer and let a new one enroll at its next login, for
-example after a reinstall or on a new machine. It changes no configuration, no commit is needed:
+example after a reinstall or on a new machine. It changes no configuration, no commit is needed. If the device gave
+the peer a WireGuard key of its own, the peer gets the key of its configuration file back at once: the new device
+enrolls with the file:
 ```
 api-cli ns.wireguard allow-device-enrollment --data '{"id": "wg1_ns_76e103f5_peer", "hours": 72}'
 ```
@@ -8920,7 +8924,8 @@ Errors: validation error `id` `required`, `invalid` or `device_binding_not_requi
 ### revoke-device
 
 On a server with `device_binding`, forget the device of a peer and end its session: the peer can't log in until a
-new enrollment is allowed. It changes no configuration, no commit is needed:
+new enrollment is allowed. It changes no configuration, no commit is needed. A WireGuard key the device gave the
+peer is dropped too, the peer gets the key of its configuration file back:
 ```
 api-cli ns.wireguard revoke-device --data '{"id": "wg1_ns_76e103f5_peer"}'
 ```

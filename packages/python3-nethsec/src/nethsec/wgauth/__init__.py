@@ -17,7 +17,9 @@ The daemon works on a snapshot of the configuration, see `build_state`, taken wh
 changes saved but not applied yet don't reach it.
 
 A gated server can also require device binding: a peer logs in only from the device enrolled for it, which signs
-every login with a key that never leaves it, see `verify_device`.
+every login with a key that never leaves it, see `verify_device`. The enrolled device can then give the peer a
+WireGuard key of its own, see `set_device_wireguard_key`: the configuration file, and every copy of it, no longer
+connects.
 
 See docs/design/wireguard_user_auth.md and docs/design/wireguard_device_binding.md.
 """
@@ -85,6 +87,8 @@ MAX_ENROLL_WINDOW = 30 * 86400
 CHALLENGE_TTL = 60
 MAX_CHALLENGES = 4
 DEVICE_MESSAGE = "ns-wgauth-device-v1"
+# signed by an enrolled device to give its peer its own WireGuard key, see verify_wireguard_key
+WIREGUARD_KEY_MESSAGE = "ns-wgauth-wireguard-key-v1"
 DEVICE_KINDS = ("software", "tpm", "secure-enclave")
 # DER SubjectPublicKeyInfo of a P-256 public key, before its 65 bytes uncompressed point
 P256_SPKI_PREFIX = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200")
@@ -1329,7 +1333,8 @@ def read_handshakes():
     Read the latest handshake of every WireGuard peer.
 
     Returns:
-      - a dictionary `{public_key: timestamp}`, None if `wg` can't be run
+      - a dictionary `{public_key: timestamp}`, by the key of the peer in the configuration, see `to_peer_keys`;
+        None if `wg` can't be run
     """
     try:
         process = _run(["wg", "show", "all", "latest-handshakes"])
@@ -1342,7 +1347,45 @@ def read_handshakes():
         fields = line.split("\t")
         if len(fields) == 3 and fields[2].isdigit():
             handshakes[fields[1]] = int(fields[2])
-    return handshakes
+    return to_peer_keys(handshakes, device_wireguard_keys(load_devices()))
+
+
+def device_wireguard_keys(devices):
+    """
+    Return the WireGuard keys the enrolled devices gave their peers, see `set_device_wireguard_key`.
+
+    Arguments:
+      - devices -- see `load_devices`
+
+    Returns:
+      - a dictionary `{device key: key of the peer in the configuration}`
+    """
+    keys = {}
+    for entry in devices.values():
+        device = entry.get("device") if isinstance(entry, dict) else None
+        if isinstance(device, dict) and device.get("wireguard_key") and entry.get("public_key"):
+            keys[device["wireguard_key"]] = entry["public_key"]
+    return keys
+
+
+def to_peer_keys(data, keys):
+    """
+    Give what WireGuard reports for the key of a device to the key of its peer in the configuration, the one the
+    sessions, the alerts and the history know the peer by.
+
+    Arguments:
+      - data -- a dictionary by WireGuard public key, see `read_endpoints`
+      - keys -- see `device_wireguard_keys`
+
+    Returns:
+      - the dictionary by key of the configuration. When WireGuard has both keys, for a few seconds after the
+        interface restarts, the key of the device wins: the other one is a copy of the configuration
+    """
+    result = {key: value for key, value in data.items() if key not in keys}
+    for key, value in data.items():
+        if key in keys:
+            result[keys[key]] = value
+    return result
 
 
 def endpoint_address(endpoint):
@@ -1365,7 +1408,8 @@ def read_endpoints():
     Read the public IP every WireGuard peer is sending from.
 
     Returns:
-      - a dictionary `{public_key: ip}` of the peers with a known endpoint, None if `wg` can't be run
+      - a dictionary `{public_key: ip}` of the peers with a known endpoint, by the key of the peer in the
+        configuration, see `to_peer_keys`; None if `wg` can't be run
     """
     try:
         process = _run(["wg", "show", "all", "endpoints"])
@@ -1378,7 +1422,7 @@ def read_endpoints():
         fields = line.split("\t")
         if len(fields) == 3 and fields[2] != "(none)":
             endpoints[fields[1]] = endpoint_address(fields[2])
-    return endpoints
+    return to_peer_keys(endpoints, device_wireguard_keys(load_devices()))
 
 
 def dns_answer(query, address, ttl=DNS_TTL):
@@ -1560,7 +1604,9 @@ def load_devices():
       - a dictionary `{peer: {"public_key": key, "window_until": timestamp, "device": device}}`: `public_key` is the
         WireGuard key of the peer the entry belongs to, `window_until` the end of its enrollment window, 0 when
         closed, `device` None or `{"key": base64 public key, "kind": kind, "name": name, "machine_id": hmac,
-        "enrolled": timestamp, "last_used": timestamp, "endpoint": ip}`
+        "enrolled": timestamp, "last_used": timestamp, "endpoint": ip}`, with `"wireguard_key"` and
+        `"wireguard_key_set"` once the device gave the peer a WireGuard key of its own, see
+        `set_device_wireguard_key`
     """
     data = _read_json(DEVICES_FILE, {})
     return data if isinstance(data, dict) else {}
@@ -1824,7 +1870,8 @@ def verify_device(state, server, address, peer, username, proof, entry, now=None
     The device keeps a P-256 key pair that never leaves it and signs `device_message`. It can be enrolled during the
     enrollment window of the peer, then only that device can log in. With `machine_id`, the device also sends an
     HMAC-SHA256 of the ID of its machine, keyed with the server public key, recorded at enrollment and compared at
-    every login. The challenge of the proof must already be checked, see `Challenges`.
+    every login. The challenge of the proof must already be checked, see `Challenges`. The signed message names the
+    key of the peer in the configuration, or the WireGuard key the device gave it, see `set_device_wireguard_key`.
 
     Arguments:
       - state -- see `build_state`
@@ -1869,8 +1916,15 @@ def verify_device(state, server, address, peer, username, proof, entry, now=None
     if not config["public_key"]:
         log(f"cannot check the devices of {server}: its public key is unknown", syslog.LOG_ERR)
         return "device_mismatch", None
-    message = device_message(challenge, config["public_key"], peer["public_key"], address, username, machine_id)
-    if not verify_signature(key, message, signature):
+    # the key of the configuration, or the WireGuard key the device gave the peer, the one it has now
+    peer_keys = [peer["public_key"]]
+    if not enrolling and device.get("wireguard_key"):
+        peer_keys.append(device["wireguard_key"])
+    messages = [
+        device_message(challenge, config["public_key"], peer_key, address, username, machine_id)
+        for peer_key in peer_keys
+    ]
+    if not any(verify_signature(key, message, signature) for message in messages):
         return "device_mismatch", None
     if not enrolling:
         return None, None
@@ -1921,6 +1975,272 @@ def record_device_login(peer, enrolled, machine_id, endpoint, now=None):
             return False
         save_devices(devices)
     return True
+
+
+def decode_wireguard_key(text):
+    """
+    Check a WireGuard public key.
+
+    Arguments:
+      - text -- the key, base64
+
+    Returns:
+      - the key as WireGuard writes it, None if `text` isn't 32 bytes in base64
+    """
+    if not isinstance(text, str):
+        return None
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(raw) != 32 or base64.b64encode(raw).decode() != text:
+        return None
+    return text
+
+
+def wireguard_key_message(challenge, server_key, peer_key, address, wireguard_key):
+    """
+    Build the message an enrolled device signs to give its peer a WireGuard key of its own, see
+    `verify_wireguard_key`.
+
+    Arguments:
+      - challenge -- see `Challenges`
+      - server_key -- WireGuard public key of the server
+      - peer_key -- WireGuard public key of the peer in the configuration
+      - address -- reserved IP of the peer
+      - wireguard_key -- the new WireGuard public key
+
+    Returns:
+      - the message, as bytes
+    """
+    fields = [WIREGUARD_KEY_MESSAGE, challenge, server_key, peer_key, address, wireguard_key]
+    return "\n".join(fields).encode()
+
+
+def read_used_keys():
+    """
+    Read the WireGuard keys in use on the firewall: of its interfaces and of their peers.
+
+    Returns:
+      - a set of public keys, empty if `wg` can't be run
+    """
+    try:
+        process = _run(["wg", "show", "all", "dump"])
+    except OSError:
+        return set()
+    if process.returncode != 0:
+        return set()
+    keys = set()
+    for line in process.stdout.splitlines():
+        fields = line.split("\t")
+        # an interface: name, private key, public key, port, fwmark; a peer: name, public key and 7 more
+        if len(fields) == 5:
+            keys.add(fields[2])
+        elif len(fields) == 9:
+            keys.add(fields[1])
+    return keys
+
+
+def verify_wireguard_key(state, server, address, peer, entry, request, used=None):
+    """
+    Check the request of an enrolled device to give its peer a WireGuard key of its own: the device makes the key
+    pair, the private key never leaves it, and signs `wireguard_key_message` with its device key. The challenge of the
+    request must already be checked, see `Challenges`, and the peer logged in.
+
+    Arguments:
+      - state -- see `build_state`
+      - server -- WireGuard server interface name
+      - address -- reserved IP of the peer
+      - peer -- the peer entry returned by `find_peer`
+      - entry -- the device entry of the peer, see `peer_device`
+      - request -- `challenge`, `wireguard_key` (base64) and `signature` (base64 DER)
+      - used -- see `read_used_keys`, read if missing
+
+    Returns:
+      - `(None, key)` if the device signed a key nobody uses, `key` being the one to record, see
+        `set_device_wireguard_key`; the key the peer has already is accepted again
+      - `(error, None)` otherwise: `device_not_enrolled`, `invalid_key`, `key_in_use` or `device_mismatch`
+    """
+    device = entry.get("device") if entry else None
+    if not isinstance(device, dict):
+        return "device_not_enrolled", None
+    wireguard_key = decode_wireguard_key(request.get("wireguard_key"))
+    if wireguard_key is None:
+        return "invalid_key", None
+    if wireguard_key != device.get("wireguard_key"):
+        devices = load_devices()
+        taken = set(state.get("peer_keys", {}).values()) | set(device_wireguard_keys(devices))
+        taken |= read_used_keys() if used is None else used
+        taken |= {config["public_key"] for config in state["servers"].values() if config.get("public_key")}
+        # another peer would get the address of this one: WireGuard tells peers apart by their key only
+        if wireguard_key in taken:
+            return "key_in_use", None
+    challenge = request.get("challenge")
+    key = decode_public_key(device.get("key"))
+    signature = _decode_signature(request.get("signature"))
+    config = state["servers"][server]
+    if key is None or signature is None or not _is_line(challenge) or not config["public_key"]:
+        return "device_mismatch", None
+    message = wireguard_key_message(challenge, config["public_key"], peer["public_key"], address, wireguard_key)
+    if not verify_signature(key, message, signature):
+        return "device_mismatch", None
+    return None, wireguard_key
+
+
+def set_device_wireguard_key(peer, device_key, wireguard_key, now=None):
+    """
+    Record the WireGuard key an enrolled device gave its peer, see `verify_wireguard_key`. The key of the
+    configuration is no longer used: once `apply_device_keys` puts the new key on the interface, the configuration
+    file, and every copy of it, gets no handshake. A new enrollment, see `allow_enrollment` and `revoke_device`,
+    goes back to the key of the configuration.
+
+    Arguments:
+      - peer -- the peer entry returned by `find_peer`
+      - device_key -- the `key` of the device that signed: the key is recorded only if it's still the enrolled one
+      - wireguard_key -- the new WireGuard public key
+      - now -- current UNIX timestamp
+
+    Returns:
+      - False if the device isn't enrolled anymore
+    """
+    now = int(time.time()) if now is None else now
+    with state_lock():
+        devices = load_devices()
+        entry = peer_device(devices, peer["peer"], peer["public_key"])
+        device = entry.get("device") if entry else None
+        if not isinstance(device, dict) or device.get("key") != device_key:
+            return False
+        if device.get("wireguard_key") == wireguard_key:
+            return True
+        device["wireguard_key"] = wireguard_key
+        device["wireguard_key_set"] = now
+        save_devices(devices)
+    log(
+        f"device key: peer={peer['peer']} user={peer['user']} connects with the WireGuard key of its device "
+        f"{device.get('name', '')!r}, its configuration file no longer connects"
+    )
+    return True
+
+
+def peer_wireguard_key(devices, peer):
+    """
+    Return the WireGuard key a peer connects with.
+
+    Arguments:
+      - devices -- see `load_devices`
+      - peer -- the peer entry returned by `find_peer`
+
+    Returns:
+      - the key its enrolled device gave it, or the key of the configuration
+    """
+    entry = peer_device(devices, peer["peer"], peer["public_key"])
+    device = entry.get("device") if entry else None
+    if isinstance(device, dict) and device.get("wireguard_key"):
+        return device["wireguard_key"]
+    return peer["public_key"]
+
+
+def read_interface_peers(interface):
+    """
+    Read the peers of a WireGuard interface as the kernel has them.
+
+    Arguments:
+      - interface -- the interface name
+
+    Returns:
+      - a dictionary `{public_key: {"preshared_key", "allowed_ips", "keepalive"}}`, the pre-shared key and the
+        keepalive empty when there is none, None if the interface can't be read
+    """
+    try:
+        process = _run(["wg", "show", interface, "dump"])
+    except OSError:
+        return None
+    if process.returncode != 0:
+        return None
+    peers = {}
+    for line in process.stdout.splitlines():
+        fields = line.split("\t")
+        # the first line is the interface, with 4 fields
+        if len(fields) != 8:
+            continue
+        public_key, preshared_key, _endpoint, allowed_ips, _handshake, _rx, _tx, keepalive = fields
+        peers[public_key] = {
+            "preshared_key": "" if preshared_key == "(none)" else preshared_key,
+            "allowed_ips": [] if allowed_ips == "(none)" else allowed_ips.split(","),
+            "keepalive": "" if keepalive in ("off", "0") else keepalive,
+        }
+    return peers
+
+
+def switch_peer_key(interface, old, new, settings):
+    """
+    Give a peer of a WireGuard interface another key, keeping its pre-shared key, allowed IPs and keepalive.
+
+    Arguments:
+      - interface -- the interface name
+      - old -- the key the peer has
+      - new -- the key it gets
+      - settings -- the settings of the peer, see `read_interface_peers`
+    """
+    command = ["wg", "set", interface, "peer", old, "remove", "peer", new]
+    if settings["preshared_key"]:
+        # never on the command line
+        command += ["preshared-key", "/dev/stdin"]
+    if settings["allowed_ips"]:
+        command += ["allowed-ips", ",".join(settings["allowed_ips"])]
+    if settings["keepalive"]:
+        command += ["persistent-keepalive", settings["keepalive"]]
+    secret = settings["preshared_key"] + "\n" if settings["preshared_key"] else None
+    try:
+        process = _run(command, input=secret)
+    except OSError as error:
+        raise RuntimeError(f"wg failed: {error}") from error
+    if process.returncode != 0:
+        raise RuntimeError(f"wg failed: {process.stderr.strip()}")
+
+
+def apply_device_keys(state, only=None, dry_run=False):
+    """
+    Put on the interfaces the WireGuard keys the enrolled devices gave their peers, see `set_device_wireguard_key`,
+    and the keys of the configuration back for the others.
+
+    The configuration keeps the key of the configuration file: the daemon must never commit the changes the
+    administrator saved but didn't apply. Restarting an interface sets the keys of the configuration again, so this
+    runs when an interface comes up, see the hotplug script of ns-wgauth, and at every check of the daemon. A peer
+    is found on the interface by its reserved IP, in its allowed IPs.
+
+    Arguments:
+      - state -- see `build_state`
+      - only -- the one server to check
+      - dry_run -- only tell what would change
+
+    Returns:
+      - the list of `(server, peer, kind)` changed, `kind` being `device` or `configuration`: the key the peer has now
+    """
+    done = []
+    with state_lock():
+        devices = load_devices()
+        for server, config in sorted(state["servers"].items()):
+            if (only is not None and server != only) or not config.get("device_binding"):
+                continue
+            live = read_interface_peers(server)
+            if not live:
+                continue
+            wanted = {address: peer_wireguard_key(devices, peer) for address, peer in config["peers"].items()}
+            for key, settings in sorted(live.items()):
+                addresses = [ip[: -len("/32")] for ip in settings["allowed_ips"] if ip.endswith("/32")]
+                address = next((address for address in addresses if address in wanted), None)
+                if address is None or not wanted[address] or key == wanted[address]:
+                    continue
+                peer = config["peers"][address]
+                if not dry_run:
+                    switch_peer_key(server, key, wanted[address], settings)
+                kind = "configuration" if wanted[address] == peer["public_key"] else "device"
+                done.append((server, peer, kind))
+    if not dry_run:
+        for server, peer, kind in done:
+            log(f"WireGuard key of peer {peer['peer']} of user={peer['user']} on {server}: the key of its {kind}")
+    return [(server, peer["peer"], kind) for server, peer, kind in done]
 
 
 class Challenges:
