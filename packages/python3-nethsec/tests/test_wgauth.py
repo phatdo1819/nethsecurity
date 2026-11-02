@@ -124,12 +124,14 @@ def _setup_db(tmp_path, port=True):
 class FakeCommands:
     """Replace `wgauth._run`: answer nft, wg and ubus like the firewall would."""
 
-    def __init__(self, table=None, handshakes="", endpoints="", failing=()):
+    def __init__(self, table=None, handshakes="", endpoints="", failing=(), dumps=None):
         self.table = table
         self.handshakes = handshakes
         self.endpoints = endpoints
         # scripts nft refuses, matched by their first line
         self.failing = failing
+        # the output of wg show INTERFACE dump, by interface, and "all"
+        self.dumps = dumps or {}
         self.calls = []
 
     def __call__(self, cmd, input=None):
@@ -146,6 +148,10 @@ class FakeCommands:
             return subprocess.CompletedProcess(cmd, 0, self.handshakes, "")
         if cmd == ["wg", "show", "all", "endpoints"]:
             return subprocess.CompletedProcess(cmd, 0, self.endpoints, "")
+        if cmd[:2] == ["wg", "show"] and cmd[-1] == "dump":
+            if cmd[2] not in self.dumps:
+                return subprocess.CompletedProcess(cmd, 1, "", "Unable to access interface: No such device")
+            return subprocess.CompletedProcess(cmd, 0, self.dumps[cmd[2]], "")
         if cmd == ["wg", "pubkey"]:
             return subprocess.CompletedProcess(cmd, 0, SERVER_KEY + "\n", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -1388,3 +1394,246 @@ def test_verify_device_machine_id(tmp_path, mocker, run_dir):
     wgauth.save_devices({peer["peer"]: entry})
     assert wgauth.record_device_login(peer, None, "cd" * 32, "203.0.113.7")
     assert _entry(peer)["device"]["machine_id"] == "cd" * 32
+
+
+# WireGuard public keys, as the devices make them
+DEVICE_WG_KEY = base64.b64encode(bytes(range(32))).decode()
+OTHER_WG_KEY = base64.b64encode(bytes([7] * 32)).decode()
+LIVE_WG_KEY = base64.b64encode(bytes([9] * 32)).decode()
+
+
+def _dump(*peers):
+    """The output of wg show wg1 dump: the interface, then the peers as (key, psk, allowed ips, keepalive)."""
+    lines = [f"PRIVATE\t{SERVER_KEY}\t51820\toff"]
+    for key, psk, allowed, keepalive in peers:
+        lines.append(f"{key}\t{psk}\t(none)\t{allowed}\t0\t0\t0\t{keepalive}")
+    return "\n".join(lines) + "\n"
+
+
+def _own_key_state(tmp_path, mocker, dumps):
+    u = _setup_db(tmp_path)
+    _bind_devices(u)
+    fake = FakeCommands(dumps=dumps)
+    mocker.patch("nethsec.wgauth._run", fake)
+    state = wgauth.build_state(u)
+    wgauth.sync_devices(state, now=int(time.time()))
+    _server, peer = wgauth.find_peer(state, "10.103.1.2")
+    return state, peer, fake
+
+
+def _enroll(peer, device_key="DEVICE_KEY"):
+    enrolled = {"key": device_key, "kind": "software", "name": "LAPTOP-42", "machine_id": ""}
+    assert wgauth.record_device_login(peer, enrolled, "", "203.0.113.7")
+
+
+def test_peer_keys_of_devices(tmp_path, mocker, run_dir):
+    devices = {
+        ALICE: {"public_key": "KEY_ALICE", "window_until": 0, "device": {"key": "K", "wireguard_key": DEVICE_WG_KEY}},
+        "wg1_ns_eeeeeeee_peer": {"public_key": "KEY_NOBODY", "window_until": 0, "device": {"key": "K2"}},
+        "wg1_ns_ffffffff_peer": {"public_key": "KEY_X", "window_until": 1, "device": None},
+    }
+    keys = wgauth.device_wireguard_keys(devices)
+    assert keys == {DEVICE_WG_KEY: "KEY_ALICE"}
+    # what WireGuard says of the key of the device is about its peer; a copy of the configuration, there for a few
+    # seconds after an interface restart, loses
+    assert wgauth.to_peer_keys({DEVICE_WG_KEY: 1, "KEY_ALICE": 2, "KEY_B": 3}, keys) == {"KEY_ALICE": 1, "KEY_B": 3}
+    assert wgauth.to_peer_keys({"KEY_ALICE": 2}, keys) == {"KEY_ALICE": 2}
+    wgauth.save_devices(devices)
+    fake = FakeCommands(
+        endpoints=f"wg1\t{DEVICE_WG_KEY}\t203.0.113.7:51820\nwg1\tKEY_B\t198.51.100.1:4500\n",
+        handshakes=f"wg1\t{DEVICE_WG_KEY}\t1000\nwg1\tKEY_B\t900\n",
+    )
+    mocker.patch("nethsec.wgauth._run", fake)
+    assert wgauth.read_endpoints() == {"KEY_ALICE": "203.0.113.7", "KEY_B": "198.51.100.1"}
+    assert wgauth.read_handshakes() == {"KEY_ALICE": 1000, "KEY_B": 900}
+
+
+def test_decode_wireguard_key():
+    assert wgauth.decode_wireguard_key(DEVICE_WG_KEY) == DEVICE_WG_KEY
+    for bad in (
+        None,
+        1,
+        "",
+        "!",
+        base64.b64encode(bytes(31)).decode(),
+        DEVICE_WG_KEY.rstrip("="),
+        DEVICE_WG_KEY + "\n",
+    ):
+        assert wgauth.decode_wireguard_key(bad) is None
+    # the same bytes written another way
+    assert wgauth.decode_wireguard_key(DEVICE_WG_KEY[:42] + "9=") is None
+
+
+def test_read_interface_peers_and_switch(mocker):
+    dump = _dump(
+        ("KEY_ALICE", "PSK", "10.103.1.2/32,192.168.5.0/24", "25"),
+        ("KEY_NOBODY", "(none)", "10.103.1.4/32", "off"),
+        ("KEY_EMPTY", "(none)", "(none)", "off"),
+    )
+    fake = FakeCommands(dumps={"wg1": dump})
+    mocker.patch("nethsec.wgauth._run", fake)
+    peers = wgauth.read_interface_peers("wg1")
+    assert peers == {
+        "KEY_ALICE": {"preshared_key": "PSK", "allowed_ips": ["10.103.1.2/32", "192.168.5.0/24"], "keepalive": "25"},
+        "KEY_NOBODY": {"preshared_key": "", "allowed_ips": ["10.103.1.4/32"], "keepalive": ""},
+        "KEY_EMPTY": {"preshared_key": "", "allowed_ips": [], "keepalive": ""},
+    }
+    assert wgauth.read_interface_peers("wg9") is None
+    wgauth.switch_peer_key("wg1", "KEY_ALICE", DEVICE_WG_KEY, peers["KEY_ALICE"])
+    command, secret = fake.calls[-1]
+    assert command == [
+        "wg", "set", "wg1", "peer", "KEY_ALICE", "remove", "peer", DEVICE_WG_KEY,
+        "preshared-key", "/dev/stdin", "allowed-ips", "10.103.1.2/32,192.168.5.0/24", "persistent-keepalive", "25",
+    ]  # fmt: skip
+    # the pre-shared key never goes on the command line
+    assert secret == "PSK\n"
+    wgauth.switch_peer_key("wg1", "KEY_NOBODY", DEVICE_WG_KEY, peers["KEY_NOBODY"])
+    expected = [
+        "wg",
+        "set",
+        "wg1",
+        "peer",
+        "KEY_NOBODY",
+        "remove",
+        "peer",
+        DEVICE_WG_KEY,
+        "allowed-ips",
+        "10.103.1.4/32",
+    ]
+    assert fake.calls[-1] == (expected, None)
+    mocker.patch("nethsec.wgauth._run", lambda cmd, input=None: subprocess.CompletedProcess(cmd, 1, "", "Invalid key"))
+    with pytest.raises(RuntimeError, match="Invalid key"):
+        wgauth.switch_peer_key("wg1", "KEY_NOBODY", DEVICE_WG_KEY, peers["KEY_NOBODY"])
+
+
+def test_set_device_wireguard_key(tmp_path, mocker, run_dir):
+    _state, peer, _fake = _own_key_state(tmp_path, mocker, {})
+    # not enrolled
+    assert not wgauth.set_device_wireguard_key(peer, "DEVICE_KEY", DEVICE_WG_KEY, now=1000)
+    _enroll(peer)
+    # signed by a device that isn't the enrolled one anymore
+    assert not wgauth.set_device_wireguard_key(peer, "OTHER_KEY", DEVICE_WG_KEY, now=1000)
+    assert wgauth.peer_wireguard_key(wgauth.load_devices(), peer) == "KEY_ALICE"
+    assert wgauth.set_device_wireguard_key(peer, "DEVICE_KEY", DEVICE_WG_KEY, now=1000)
+    device = _entry(peer)["device"]
+    assert device["wireguard_key"] == DEVICE_WG_KEY and device["wireguard_key_set"] == 1000
+    assert wgauth.peer_wireguard_key(wgauth.load_devices(), peer) == DEVICE_WG_KEY
+    # the same key again changes nothing
+    assert wgauth.set_device_wireguard_key(peer, "DEVICE_KEY", DEVICE_WG_KEY, now=2000)
+    assert _entry(peer)["device"]["wireguard_key_set"] == 1000
+    # the logins of the device keep it
+    assert wgauth.record_device_login(peer, None, "", "198.51.100.1")
+    assert wgauth.peer_wireguard_key(wgauth.load_devices(), peer) == DEVICE_WG_KEY
+    # a new enrollment goes back to the key of the configuration
+    wgauth.allow_enrollment(peer["peer"], peer["public_key"])
+    assert wgauth.peer_wireguard_key(wgauth.load_devices(), peer) == "KEY_ALICE"
+    _enroll(peer)
+    assert wgauth.set_device_wireguard_key(peer, "DEVICE_KEY", DEVICE_WG_KEY)
+    wgauth.revoke_device(peer["peer"], peer["public_key"])
+    assert wgauth.peer_wireguard_key(wgauth.load_devices(), peer) == "KEY_ALICE"
+
+
+def test_apply_device_keys(tmp_path, mocker, run_dir):
+    dump = _dump(
+        ("KEY_ALICE", "PSK", "10.103.1.2/32", "off"),
+        ("KEY_NOBODY", "(none)", "10.103.1.4/32", "off"),
+        # a peer the login doesn't know about, a site for example
+        ("KEY_SITE", "(none)", "10.200.0.0/24", "off"),
+    )
+    state, peer, fake = _own_key_state(tmp_path, mocker, {"wg1": dump})
+
+    def switches():
+        return [cmd for cmd in fake.commands("wg") if cmd[1] == "set"]
+
+    # every peer has the key of its configuration
+    assert wgauth.apply_device_keys(state) == []
+    _enroll(peer)
+    assert wgauth.set_device_wireguard_key(peer, "DEVICE_KEY", DEVICE_WG_KEY)
+    # the check only tells
+    assert wgauth.apply_device_keys(state, dry_run=True) == [("wg1", ALICE, "device")]
+    assert switches() == []
+    assert wgauth.apply_device_keys(state) == [("wg1", ALICE, "device")]
+    assert switches() == [
+        ["wg", "set", "wg1", "peer", "KEY_ALICE", "remove", "peer", DEVICE_WG_KEY,
+         "preshared-key", "/dev/stdin", "allowed-ips", "10.103.1.2/32"],
+    ]  # fmt: skip
+    # once it's there, nothing more
+    fake.dumps["wg1"] = _dump(
+        (DEVICE_WG_KEY, "PSK", "10.103.1.2/32", "off"), ("KEY_NOBODY", "(none)", "10.103.1.4/32", "off")
+    )
+    assert wgauth.apply_device_keys(state) == []
+    # an interface restart sets the key of the configuration again
+    fake.dumps["wg1"] = dump
+    assert wgauth.apply_device_keys(state, only="wg1") == [("wg1", ALICE, "device")]
+    assert wgauth.apply_device_keys(state, only="wg2") == []
+    fake.dumps["wg1"] = _dump((DEVICE_WG_KEY, "PSK", "10.103.1.2/32", "off"))
+    # without a device, the key of the configuration again
+    wgauth.revoke_device(peer["peer"], peer["public_key"])
+    assert wgauth.apply_device_keys(state) == [("wg1", ALICE, "configuration")]
+    assert switches()[-1][3:8] == ["peer", DEVICE_WG_KEY, "remove", "peer", "KEY_ALICE"]
+    # an interface that's down
+    del fake.dumps["wg1"]
+    assert wgauth.apply_device_keys(state) == []
+    # a server without device binding isn't touched
+    fake.dumps["wg1"] = _dump((DEVICE_WG_KEY, "PSK", "10.103.1.2/32", "off"))
+    state["servers"]["wg1"]["device_binding"] = False
+    assert wgauth.apply_device_keys(state) == []
+
+
+@needs_openssl
+def test_verify_wireguard_key(tmp_path, mocker, run_dir):
+    used = f"wg1\tPRIVATE\t{SERVER_KEY}\t51820\toff\nwg9\tKEY_ALICE\t(none)\t(none)\t10.103.1.2/32\t0\t0\t0\toff\n"
+    used += f"wg9\t{LIVE_WG_KEY}\t(none)\t(none)\t10.9.0.2/32\t0\t0\t0\toff\n"
+    state, peer, fake = _own_key_state(tmp_path, mocker, {"all": used})
+    device = Device(tmp_path.joinpath("device"))
+    other = Device(tmp_path.joinpath("other"))
+
+    def request(key=DEVICE_WG_KEY, challenge="C1", signer=device, signed_key=None):
+        message = wgauth.wireguard_key_message(challenge, SERVER_KEY, "KEY_ALICE", "10.103.1.2", signed_key or key)
+        return {"challenge": challenge, "wireguard_key": key, "signature": signer.sign(message)}
+
+    def verify(data):
+        return wgauth.verify_wireguard_key(state, "wg1", "10.103.1.2", peer, _entry(peer), data)
+
+    assert verify(request()) == ("device_not_enrolled", None)
+    _enroll(peer, device.public_key)
+    assert verify(request()) == (None, DEVICE_WG_KEY)
+    # signed by another device, or for another key
+    assert verify(request(signer=other)) == ("device_mismatch", None)
+    assert verify(request(signed_key=OTHER_WG_KEY)) == ("device_mismatch", None)
+    assert verify(dict(request(), signature="!")) == ("device_mismatch", None)
+    assert verify(dict(request(), challenge="a\nb")) == ("device_mismatch", None)
+    assert verify(request(key="KEY")) == ("invalid_key", None)
+    # a key another peer, another device, the server or another interface has: WireGuard would mix up the peers
+    elsewhere = base64.b64encode(bytes([5] * 32)).decode()
+    state["peer_keys"]["wg1_ns_eeeeeeee_peer"] = OTHER_WG_KEY
+    devices = wgauth.load_devices()
+    devices["wg4_ns_dddddddd_peer"] = {
+        "public_key": "KEY_ALICE_4",
+        "window_until": 0,
+        "device": {"key": "K", "wireguard_key": elsewhere},
+    }
+    wgauth.save_devices(devices)
+    for key in (OTHER_WG_KEY, SERVER_KEY, LIVE_WG_KEY, elsewhere):
+        assert verify(request(key=key)) == ("key_in_use", None)
+    # the key the peer has already: the device asks again when it missed the answer
+    assert wgauth.set_device_wireguard_key(peer, device.public_key, DEVICE_WG_KEY)
+    fake.dumps["all"] = used + f"wg1\t{DEVICE_WG_KEY}\t(none)\t(none)\t10.103.1.2/32\t0\t0\t0\toff\n"
+    assert verify(request()) == (None, DEVICE_WG_KEY)
+
+
+@needs_openssl
+def test_verify_device_with_its_wireguard_key(tmp_path, mocker, run_dir):
+    state, peer = _device_state(tmp_path, mocker)
+    device = Device(tmp_path.joinpath("device"))
+    verify = wgauth.verify_device
+    error, enrolled = verify(state, "wg1", "10.103.1.2", peer, "alice", device.proof("C1"), _entry(peer))
+    assert error is None and wgauth.record_device_login(peer, enrolled, "", "203.0.113.7")
+    assert wgauth.set_device_wireguard_key(peer, device.public_key, DEVICE_WG_KEY)
+    entry = _entry(peer)
+    # the device signs with the key it connects with now, or with the one of the configuration
+    proof = device.proof("C2", peer_key=DEVICE_WG_KEY)
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", proof, entry) == (None, None)
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", device.proof("C3"), entry) == (None, None)
+    proof = device.proof("C4", peer_key=OTHER_WG_KEY)
+    assert verify(state, "wg1", "10.103.1.2", peer, "alice", proof, entry)[0] == "device_mismatch"

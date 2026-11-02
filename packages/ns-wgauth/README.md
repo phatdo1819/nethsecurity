@@ -103,6 +103,11 @@ not secure.
   keys drops them.
 - With device binding, the enrolled devices and the open enrollments are in `/etc/ns-wgauth/devices.json`, kept the
   same way and tied to the keys of the peer too. The signatures are checked with `openssl`.
+- After the login, the enrolled device can give the peer a WireGuard key of its own (`POST /api/device-key`): the
+  daemon puts it on the interface with `wg set` instead of the key of the configuration, and the `.conf` file, and
+  every copy of it, gets no handshake anymore. UCI keeps the key of the `.conf` file, so a restart of the interface
+  sets it again: the hotplug script `/etc/hotplug.d/iface/90-ns-wgauth` and the 15-second check put the key of the
+  device back. See [the WireGuard key of the device](../../design/wireguard_device_binding#the-wireguard-key-of-the-device).
 - The init script runs before the network, so the gate exists before the WireGuard interfaces come up. procd runs it
   again when the `network`, `users` or `ns-wgauth` configuration changes. The daemon runs only while a server
   requires the login, and checks the table and the sessions every 15 seconds: if the table is missing, it builds
@@ -124,6 +129,7 @@ ns-wgauth logout <peer>   # end the session of a peer, e.g. wg1_ns_1234abcd_peer
 ns-wgauth alerts          # suspected copies and lockouts, as JSON
 ns-wgauth clear <peer>    # forget the alerts of a peer and unblock it
 ns-wgauth devices         # enrolled devices and open enrollments, as JSON
+ns-wgauth keys [server]   # put the WireGuard keys of the enrolled devices on the interfaces
 ns-wgauth sync            # apply the configuration now
 nft list table inet ns_wgauth
 ```
@@ -152,7 +158,10 @@ With device binding, the status also returns `"device": {"required": true, "enro
 "machine_id": false, "challenge": "..."}`, and the login needs a `device` object signed by the device, see the
 [login protocol](../../design/wireguard_device_binding#login-protocol). More errors:
 `403 {"error": "device_required"}`, `403 {"error": "device_not_enrolled"}`, `401 {"error": "device_mismatch"}` and
-`401 {"error": "challenge_expired"}`.
+`401 {"error": "challenge_expired"}`. An enrolled device also finds `"wireguard_key": "configuration"` or
+`"device"` there, and once logged in can send `POST /api/device-key` with
+`{"challenge": "...", "wireguard_key": "...", "signature": "..."}`, see
+[the WireGuard key of the device](../../design/wireguard_device_binding#the-wireguard-key-of-the-device).
 
 ## Limitations
 

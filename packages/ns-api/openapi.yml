@@ -992,6 +992,16 @@ paths:
                                     type: string
                                     description: Public IP of its latest login
                                     example: 203.0.113.7
+                                  wireguard_key:
+                                    type: string
+                                    enum: [device, configuration]
+                                    description: >-
+                                      device once the enrolled device gave the peer a WireGuard key of its own: the
+                                      configuration file of the peer no longer connects
+                                  wireguard_key_set:
+                                    type: string
+                                    format: date-time
+                                    description: When the device gave its WireGuard key, only with device
                               alerts:
                                 type: array
                                 description: Suspected copies, lockouts and logins from another device, newest first

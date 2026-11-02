@@ -42,6 +42,10 @@ apps can't sign. A bound server is for those clients only.
 | a modified client that sends the ID of the enrolled machine | n/a | needs the key too | needs the key too |
 | malware or remote control on the enrolled machine | works | **works**: it uses the key in place | works |
 
+Once the enrolled device has given the peer a WireGuard key of its own, see
+[The WireGuard key of the device](#the-wireguard-key-of-the-device), a copy of the `.conf` file gets no handshake at
+all: it can't share the session either, even behind the same public IP.
+
 The key is a software key: the client keeps it like the WireGuard private key (encrypted for the system account on
 Windows, readable by root only on macOS). A normal user of the machine can't read it; an administrator of the
 machine can. Keys in a TPM or a Secure Enclave, which not even an administrator can export, can come later with the
@@ -118,7 +122,9 @@ The login API of [ns-wgauth](wireguard_user_auth.md#login-api) gets a challenge:
    <machine ID, or empty>
    ```
 
-   It ties the signature to one login, one server, one peer and one user name.
+   It ties the signature to one login, one server, one peer and one user name. The key of the peer is the one of
+   its `.conf` file, or the WireGuard key the device gave it, see
+   [The WireGuard key of the device](#the-wireguard-key-of-the-device): the firewall accepts both.
 
 4. The machine ID is `HMAC-SHA256(key = the 32 bytes of the WireGuard public key of the server, data = the ID in
    lower case)`, in hex: the firewall never sees the raw ID, and two firewalls get different values for the same
@@ -165,6 +171,69 @@ Errors:
   It counts as a failed login for the lockout of the public IP, and becomes a `device_mismatch` alert of the peer,
   at most once an hour
 
+## The WireGuard key of the device
+
+As long as the peer has the WireGuard key of its `.conf` file, every copy of the file completes the handshake: the
+login and the device key stop it from logging in, not from connecting, and a copy in the official WireGuard apps
+still takes the endpoint of the peer. So after the login the enrolled device gives the peer a WireGuard key of its
+own: it makes the key pair, and the private key never leaves it. From then on the firewall accepts only that key for
+the peer: the `.conf` file, and every copy of it, gets no handshake at all.
+
+1. A logged-in enrolled device finds `"wireguard_key": "configuration"` in the `device` of `GET /api/status`
+   (`"device"` once it gave its key). A client that supports it makes a Curve25519 key pair, and keeps the new
+   private key before asking: if the answer is lost, the old key no longer connects and the new one does.
+2. It sends `POST /api/device-key`:
+
+   ```json
+   {"challenge": "<a challenge of the status>", "wireguard_key": "<the new public key, base64>", "signature": "<DER, base64>"}
+   ```
+
+   signed with its device key over these lines joined by `\n`, without a final newline:
+
+   ```text
+   ns-wgauth-wireguard-key-v1
+   <challenge>
+   <WireGuard public key of the server>
+   <WireGuard public key of the peer in its .conf file>
+   <VPN address of the peer>
+   <the new WireGuard public key>
+   ```
+
+3. The firewall accepts it only from a peer of a bound server that is logged in (its session open, not paused), with
+   an enrolled device whose key signed, and for a key nobody else uses on the firewall: no other peer, device,
+   interface or server. WireGuard tells peers apart by their key only: another peer's key would take its place. The
+   key the peer has already is accepted again, for a client that missed the answer.
+4. `200 {"result": "success"}`. A second later the daemon switches the key on the interface: the answer goes back
+   through the tunnel of the old key. The client switches its private key too and connects again; the session goes
+   on, it belongs to the address of the peer.
+
+Errors: `401` `not_authenticated` or `challenge_expired`; `403` `device_binding_not_required`, `blocked`,
+`device_not_enrolled` or `device_mismatch`; `400` `invalid_key`; `409` `key_in_use`. A refusal is logged.
+
+How the firewall keeps it:
+
+- The key is in the device entry of `devices.json`, `wireguard_key` with `wireguard_key_set`, not in UCI: the daemon
+  must not commit the changes the administrator saved but didn't apply. UCI keeps the key of the `.conf` file.
+- `wg set <server> peer <old> remove peer <new>` puts it on the interface, with the pre-shared key (through stdin,
+  never on the command line), the allowed IPs and the keepalive the kernel has for the peer, found by its reserved IP
+  in its allowed IPs (`apply_device_keys` in `nethsec.wgauth`).
+- Restarting the interface sets the keys of UCI again, and any change to a peer of the server restarts it
+  (`post-commit/restart-wireguard.py`). The hotplug script `/etc/hotplug.d/iface/90-ns-wgauth` runs
+  `ns-wgauth keys <server>` when the interface comes up, and the daemon checks the keys at every sync, every
+  15 seconds. For those seconds the `.conf` file connects again.
+- What WireGuard reports for the key of the device, the handshakes, the endpoints, the `wg-json` of `list-servers`
+  and the connection history, is given to the key of the `.conf` file (`to_peer_keys`): the sessions, the alerts,
+  the copy detection and the history keep knowing the peer by it. When both keys are there, after a restart, the key
+  of the device wins.
+- A new enrollment, `allow-device-enrollment` or `revoke-device`, forgets the device and its key, and puts the key of
+  the `.conf` file back on the interface at once: the next device enrolls with the file. New keys
+  (`regenerate-peer-keys`) drop the device too.
+
+A copy of the `.conf` file still connects before the first enrollment and until the enrolled device gives its key
+(whoever enrolls first is the device), and for a few seconds after a restart of the interface. An administrator of
+the enrolled machine can copy its WireGuard key, like its device key. The configuration downloaded again from the
+firewall doesn't connect either: after a reinstall, allow a new enrollment.
+
 ## API
 
 `ns.wireguard`:
@@ -175,15 +244,19 @@ Errors:
 - `get-instance-defaults`: `device_binding: true` tells a client the firewall supports it
 - `list-servers`: servers return `device_binding` and `machine_id`; the peers of a bound server return `device`:
   `{"state": "enrolled" | "waiting" | "closed"}`, with `enrollment_until` while waiting, and `name`, `kind`,
-  `machine_id` (recorded or not), `enrolled`, `last_used` and `from` (public IP of the latest login) once enrolled
+  `machine_id` (recorded or not), `enrolled`, `last_used`, `from` (public IP of the latest login) and
+  `wireguard_key` (`device` or `configuration`, with `wireguard_key_set` for `device`) once enrolled
 - `allow-device-enrollment` (`{"id": "...", "hours": 72}`): forgets the device and opens the enrollment, from 1 to
   720 hours. Validation errors: `id` `device_binding_not_required`, `hours` `invalid`
 - `revoke-device` (`{"id": "..."}`): forgets the device and ends the session of the peer
 
-Both act at once, like `logout-peer`: they change no UCI option.
+Both act at once, like `logout-peer`: they change no UCI option, and put the WireGuard key of the `.conf` file back
+on the interface.
 
 `ns-wgauth devices` prints the devices and the open enrollments; `ns-wgauth check` reports a bound server without
-`openssl` or without its public key, and the peers that can't log in because their enrollment is closed.
+`openssl` or without its public key, the peers that can't log in because their enrollment is closed, how many peers
+connect with the WireGuard key of their device, and a key that isn't on the interface yet. `ns-wgauth keys [SERVER]`
+puts the keys on the interfaces.
 
 ## Life cycle
 
@@ -197,6 +270,9 @@ Both act at once, like `logout-peer`: they change no UCI option.
 | reinstall, new machine, lost key | `device_mismatch`; the administrator allows a new enrollment |
 | motherboard or VM change, with the machine ID | the same |
 | peer or server removed | its entry is dropped at the next `sync` |
+| the device gives the peer its WireGuard key | the `.conf` file stops connecting, on every device |
+| interface restart | the key of the `.conf` file for a few seconds, then the key of the device again |
+| enrollment allowed again, device revoked | the key of the `.conf` file again, at once |
 
 ## Alternatives considered
 
