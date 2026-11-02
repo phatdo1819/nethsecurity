@@ -240,9 +240,15 @@ scp packages/python3-nethsec/src/nethsec/wgauth/__init__.py $FW:$NETHSEC/wgauth/
 scp packages/ns-wgauth/files/ns-wgauth.py $FW:/usr/sbin/ns-wgauth
 scp packages/ns-wgauth/files/www/* $FW:/www-wgauth/
 scp packages/ns-api/files/ns.wireguard $FW:/usr/libexec/rpcd/ns.wireguard
+# the WireGuard key of the device: back after an interface restart, and in the connection history
+scp packages/ns-wgauth/files/ns-wgauth.hotplug $FW:/etc/hotplug.d/iface/90-ns-wgauth
+scp packages/ns-api/files/misc/wireguard-history.py $FW:/usr/libexec/wireguard-history
 # a clone on Windows has Windows line endings: they break the scripts
-ssh $FW "sed -i 's/\r$//' /usr/sbin/ns-wgauth /usr/libexec/rpcd/ns.wireguard /www-wgauth/app.js"
+ssh $FW "sed -i 's/\r$//' /usr/sbin/ns-wgauth /usr/libexec/rpcd/ns.wireguard /www-wgauth/app.js /etc/hotplug.d/iface/90-ns-wgauth /usr/libexec/wireguard-history"
 ```
+
+An image that ships `wgauth/__init__.pyc` only, without the `.py`, keeps using the `.pyc`: remove it after copying
+the `.py` (`rm $NETHSEC/wgauth/__init__.pyc`), and back it up first.
 
 The web UI comes from the `ci-wgauth` branch of nethsecurity-ui, with the device binding changes: build it with
 `npm ci` and `npm run build-only` (the result is in `dist`; on the Windows PC of the development it's already built in
@@ -289,7 +295,7 @@ An older Authway gets **device required** on a bound server.
 | The same with an Authway older than this test, or the login typed fast | **This VPN configuration is enrolled on another device and works only there: your username and password weren't checked**. The password isn't even checked: 5 tries lock out that IP |
 | Peer menu > **Revoke device** | The session ends at once. Authway shows *no device enrolled*; the peer shows **No device**, and `ns-wgauth check` warns |
 | Peer menu > **Allow a new device**, then log in from the second computer | The second computer is enrolled; the first one is refused |
-| Remove the VPN from Authway, add it again, log in | Refused: removing a VPN deletes its key. Allow a new device first |
+| Remove the VPN from Authway, add it again, connect | **The VPN server doesn't answer**: the peer has the WireGuard key of the device, and removing the VPN deleted it with the device key. Allow a new device first, then log in |
 | Peer menu > **Generate new keys**, apply, import the new `.conf` | The peer waits for the first login again, for 72 hours |
 | Turn **Machine ID** on, apply, log in | It works; the tooltip says the machine ID is recorded (the first login after turning it on records it) |
 | Turn **Device binding** off, apply | The browser and the WireGuard apps can log in again. On again: the devices enrolled before work at once |
@@ -308,6 +314,27 @@ The log has `device enrolled: peer=... name=... from=...` for every enrollment: 
 In Authway, the service log (`C:\Program Files\Authway\log\service.log`, menu **Logs**) has `new device key` at the
 first signed login. The key is kept by Windows (a key of the computer, `Authway device {GUID}`), and can't be
 exported.
+
+### The WireGuard key of the device
+
+Right after the first login, Authway gives the peer a WireGuard key it made on the computer: the firewall then
+accepts only that key, so the `.conf` file, and every copy of it, gets no handshake at all, even in the official
+WireGuard apps. It needs Authway from this version (`tools\dist.ps1` again) and the firewall files of this version,
+see [Install it on the firewall without rebuilding](#install-it-on-the-firewall-without-rebuilding).
+
+| Test | Expected |
+|---|---|
+| Log in with Authway on a server with device binding (enroll first, or **Allow a new device**) | A few seconds after the login the tunnel reconnects once, the session stays. **Device** shows a key icon next to the computer; the tooltip says *It connects with a WireGuard key it made*. In Authway, **All details** has *Key: Made by this computer* and another public key |
+| On the firewall | `ns-wgauth devices` shows `"wireguard_key": "device"`; `ns-wgauth check` prints `peers of wg1 with the WireGuard key of their device: 1`; the log has `device key: peer=... its configuration file no longer connects` |
+| Import the same `.conf` in the official WireGuard app, on a phone or another computer, and connect | No handshake: the app sends and receives nothing back. The Authway computer isn't disturbed: no `session paused` in the log, no warning on the peer |
+| Edit another peer of the server and apply: the interface restarts | The Authway computer is back within seconds; the log has `WireGuard key of peer ... the key of its device` |
+| Download the configuration of the peer from the web UI | The file doesn't connect either: the tooltip says so |
+| Peer menu > **Allow a new device** | The peer gets the key of the `.conf` file back at once (the log says `the key of its configuration`): a new device enrolls with the file. The Authway computer gets no handshake; after about 3 minutes it goes back to the key of the file by itself (its service log: `no handshake, now with the key of the configuration file`), and its next login enrolls it again and gives a new key |
+| Peer menu > **Revoke device** | The session ends and the peer gets the key of the file back; Authway, after the same 3 minutes, says *no device enrolled* |
+| Remove the VPN from Authway, add the `.conf` again | **The VPN server doesn't answer** until **Allow a new device** |
+
+Authway keeps the new key before it sends it: if the answer of the firewall is lost, the old key gets no handshake
+for 30 seconds and Authway tries the new one.
 
 ## Settings
 
@@ -339,8 +366,10 @@ scp packages/ns-wgauth/files/ns-wgauth.py $FW:/usr/sbin/ns-wgauth
 scp packages/ns-wgauth/files/www/* $FW:/www-wgauth/
 scp packages/ns-wgauth/files/config $FW:/tmp/ns-wgauth.default   # new options: compare with /etc/config/ns-wgauth
 scp packages/ns-api/files/ns.wireguard $FW:/usr/libexec/rpcd/ns.wireguard
+scp packages/ns-wgauth/files/ns-wgauth.hotplug $FW:/etc/hotplug.d/iface/90-ns-wgauth
+scp packages/ns-api/files/misc/wireguard-history.py $FW:/usr/libexec/wireguard-history
 # only from a clone on Windows: remove the Windows line endings
-ssh $FW "sed -i 's/\r$//' /usr/sbin/ns-wgauth /usr/libexec/rpcd/ns.wireguard /www-wgauth/*.js"
+ssh $FW "sed -i 's/\r$//' /usr/sbin/ns-wgauth /usr/libexec/rpcd/ns.wireguard /www-wgauth/*.js /etc/hotplug.d/iface/90-ns-wgauth /usr/libexec/wireguard-history"
 # rpcd learns the API methods added by the change
 ssh $FW "/etc/init.d/rpcd restart && /etc/init.d/ns-wgauth restart && ns-wgauth check"
 ```
