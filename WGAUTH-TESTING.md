@@ -336,6 +336,38 @@ see [Install it on the firewall without rebuilding](#install-it-on-the-firewall-
 Authway keeps the new key before it sends it: if the answer of the firewall is lost, the old key gets no handshake
 for 30 seconds and Authway tries the new one.
 
+## 10. Test the traffic between peers
+
+By default the peers of a server can't reach each other, nor the peers of another server. Two settings of the server
+drawer open it, see [the design](docs/design/wireguard_peer_traffic.md):
+
+- **Traffic between peers**: the peers of this server can connect to each other.
+- **Access to the peers of other servers**: the peers of this server can start connections to the peers of the
+  servers listed. One way: for the other way, add this server to their list.
+
+To install it on an image built before, copy the files as in [Update without rebuilding](#update-without-rebuilding),
+with the web UI as in [step 9](#install-it-on-the-firewall-without-rebuilding).
+
+The test target must answer: Windows blocks ping on a VPN adapter (a *Public* network). On the Windows computer that
+receives, allow it once in an administrator PowerShell, and remove it after the tests:
+
+```powershell
+New-NetFirewallRule -DisplayName "Ping from the VPN" -Protocol ICMPv4 -IcmpType 8 -Direction Inbound -Action Allow
+Remove-NetFirewallRule -DisplayName "Ping from the VPN"
+```
+
+| Test | Expected |
+|---|---|
+| Edit the server of the two computers: turn on **Traffic between peers**, save, apply | The card shows *Traffic between peers: Allowed*. The tunnels reconnect within seconds and the sessions stay. On the firewall, `nft list chain inet fw4 forward_wg1vpn` has `jump accept_to_wg1vpn comment "!fw4: Allow-WireGuard-wg1-client-to-client"` |
+| Log in on both computers, then ping the VPN address of one from the other (`ping 10.219.220.4`) | It answers |
+| Log out one of them | No answer: with a login, only the logged-in peers connect |
+| Turn the switch off, apply | No answer again, and the rule is gone from `forward_wg1vpn` |
+| Add a second server with a peer, connect a computer or a phone to it. On the first server, choose the second in **Access to the peers of other servers** | The drawer warns that the configurations of the peers change. After apply, the card of the first server shows *Reaches the peers of: <second>* and the other card *Reached by the peers of: <first>*. `forward_wg1vpn` has `jump accept_to_wg2vpn` |
+| Look at the configuration of a peer that doesn't route all its traffic, on either server | Its `AllowedIPs` also has the network of the other server: the answers go back through the tunnel. Import it again on the device. The peers that route all their traffic (`0.0.0.0/0`) need nothing |
+| From a peer of the first server, ping a peer of the second | It answers |
+| From the peer of the second server, ping a peer of the first | No answer: one way. Add the first server to the list of the second for this way |
+| Delete the second server | The first loses it from its list, and `uci show firewall \| grep '_to_wg'` shows no forwarding to its zone |
+
 ## Settings
 
 `/etc/config/ns-wgauth`, changed with `uci`. The changes take effect when applied:
@@ -362,6 +394,9 @@ repository folder, bash:
 FW=root@192.168.1.1
 NETHSEC=$(ssh $FW "python3 -c 'import nethsec, os; print(os.path.dirname(nethsec.__file__))'")
 scp packages/python3-nethsec/src/nethsec/wgauth/__init__.py $FW:$NETHSEC/wgauth/__init__.py
+# the traffic between peers
+ssh $FW "mkdir -p $NETHSEC/wireguard"
+scp packages/python3-nethsec/src/nethsec/wireguard/__init__.py $FW:$NETHSEC/wireguard/__init__.py
 scp packages/ns-wgauth/files/ns-wgauth.py $FW:/usr/sbin/ns-wgauth
 scp packages/ns-wgauth/files/www/* $FW:/www-wgauth/
 scp packages/ns-wgauth/files/config $FW:/tmp/ns-wgauth.default   # new options: compare with /etc/config/ns-wgauth
