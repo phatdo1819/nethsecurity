@@ -178,6 +178,21 @@ components:
           type: boolean
           description: The enrolled device must also send the ID of its machine. Requires device_binding.
           example: false
+        client_to_client:
+          type: boolean
+          description: >-
+            The peers of the server can connect to each other, with a login only the logged-in ones. Missing on
+            edit-server, it keeps its value. See docs/design/wireguard_peer_traffic.md.
+          example: false
+        reachable_servers:
+          type: array
+          description: >-
+            The WireGuard servers whose peers the peers of this server can connect to, one way: for the other way, the
+            other server lists this one. Not the server itself, no duplicates. Missing on edit-server, the list stays;
+            empty, it's removed.
+          items:
+            type: string
+          example: ["wg2"]
 
     WireGuardPeerParams:
       type: object
@@ -929,6 +944,14 @@ paths:
                           type: boolean
                         machine_id:
                           type: boolean
+                        client_to_client:
+                          type: boolean
+                          description: The peers of the server can connect to each other
+                        reachable_servers:
+                          type: array
+                          description: The servers whose peers the peers of this server can connect to, one way
+                          items:
+                            type: string
                         peers:
                           type: array
                           items:
