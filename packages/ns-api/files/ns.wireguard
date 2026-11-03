@@ -10,7 +10,7 @@ import sys
 import json
 import subprocess
 from euci import EUci
-from nethsec import utils, firewall, ovpn, users, wgauth, wghistory
+from nethsec import utils, firewall, ovpn, users, wgauth, wghistory, wireguard
 import ipaddress
 import base64
 import configparser
@@ -200,6 +200,8 @@ def get_instance_defaults():
     ret["max_fallback_endpoints"] = MAX_FALLBACK_ENDPOINTS
     # and device binding
     ret["device_binding"] = True
+    # and the traffic between peers: client_to_client and reachable_servers, see nethsec.wireguard
+    ret["peer_traffic"] = True
     return ret
 
 
@@ -244,6 +246,7 @@ def __list_peers(interface):
     server_endpoint = u.get('network', interface, 'ns_public_endpoint')
     server_port = u.get('network', interface, 'listen_port', dtype=int)
     fallback_endpoints = __fallback_endpoints(u, interface)
+    linked_networks = wireguard.linked_networks(u, interface)
 
     peers = []
     for p in utils.get_all_by_type(u, "network", f"wireguard_{interface}"):
@@ -259,7 +262,8 @@ def __list_peers(interface):
             "mtu": u.get('network', p, 'ns_mtu', dtype=int, default=0),
             "config": __generate_peer_config(
                 u, p, server_public_key, server_dns, server_name,
-                server_network, server_endpoint, server_port, fallback_endpoints=fallback_endpoints
+                server_network, server_endpoint, server_port, fallback_endpoints=fallback_endpoints,
+                linked_networks=linked_networks
             ),
         }
         public_key = u.get('network', p, 'public_key', dtype=str, default='')
@@ -454,12 +458,49 @@ def __set_auth_options(e_uci, instance, args):
                 wgauth.ensure_otp_secret(e_uci, user)
 
 
+def __validate_traffic_data(e_uci, args, instance=None):
+    """
+    Validate the traffic between peers, see nethsec.wireguard. Missing, the options keep their values on edit.
+    """
+    if 'client_to_client' in args and not isinstance(args['client_to_client'], bool):
+        return utils.validation_error('client_to_client', 'invalid', args['client_to_client'])
+    if 'reachable_servers' in args:
+        targets = args['reachable_servers']
+        if not isinstance(targets, list) or not all(isinstance(target, str) for target in targets):
+            return utils.validation_error('reachable_servers', 'invalid', targets)
+        servers = wireguard.list_servers(e_uci)
+        for index, target in enumerate(targets):
+            if target == instance:
+                return utils.validation_error('reachable_servers', 'same_server', target)
+            if target not in servers:
+                return utils.validation_error('reachable_servers', 'server_not_found', target)
+            if target in targets[:index]:
+                return utils.validation_error('reachable_servers', 'duplicate_server', target)
+    return None
+
+
+def __set_traffic_options(e_uci, instance, args):
+    if 'client_to_client' in args:
+        if args['client_to_client']:
+            e_uci.set('network', instance, 'ns_client_to_client', True)
+        else:
+            e_uci.delete('network', instance, 'ns_client_to_client')
+    if 'reachable_servers' in args:
+        if args['reachable_servers']:
+            __set_list_to_uci(e_uci, 'network', instance, 'ns_reachable_servers', args['reachable_servers'])
+        else:
+            e_uci.delete('network', instance, 'ns_reachable_servers')
+
+
 def add_server(args):
     # validate input
     err = __validate_tunnel_data(args)
     if err:
         return err
     err = __validate_auth_data(EUci(), args)
+    if err:
+        return err
+    err = __validate_traffic_data(EUci(), args)
     if err:
         return err
     # save instance
@@ -486,6 +527,7 @@ def add_server(args):
     e_uci.set('network', instance, 'disabled', not args['enabled'])
     e_uci.set('network', instance, 'ns_type', 'server')
     __set_auth_options(e_uci, instance, args)
+    __set_traffic_options(e_uci, instance, args)
     e_uci.save('network')
     # configure firewall
     firewall.add_service(
@@ -498,6 +540,7 @@ def add_server(args):
     zone = f"{instance}vpn"
     firewall.add_trusted_zone(e_uci, zone, link=f"network/{instance}")
     firewall.add_interface_to_zone(e_uci, instance, zone)
+    wireguard.sync_peer_traffic(e_uci)
 
     return {"result": "success"}
 
@@ -512,6 +555,9 @@ def edit_server(args):
     if not wgauth.is_server(e_uci, args['instance']):
         return utils.validation_error('instance', 'invalid', args['instance'])
     err = __validate_auth_data(e_uci, args, args['instance'])
+    if err:
+        return err
+    err = __validate_traffic_data(e_uci, args, args['instance'])
     if err:
         return err
     e_uci.set('network', args['instance'], 'listen_port', args['listen_port'])
@@ -537,7 +583,9 @@ def edit_server(args):
     e_uci.set('network', args['instance'], 'ns_name', args['name'])
     e_uci.set('network', args['instance'], 'disabled', not args['enabled'])
     __set_auth_options(e_uci, args['instance'], args)
+    __set_traffic_options(e_uci, args['instance'], args)
     e_uci.save('network')
+    wireguard.sync_peer_traffic(e_uci)
 
     return {"result": "success"}
 
@@ -548,6 +596,8 @@ def delete_server(args):
     e_uci = EUci()
     if e_uci.get('network', args['instance'], 'proto', default='invalid') != 'wireguard':
         return utils.validation_error('instance', 'invalid', args['instance'])
+    # the other servers no longer reach its peers
+    wireguard.remove_server(e_uci, args['instance'])
     # remove interface
     e_uci.delete('network', args['instance'])
     for entry in e_uci.get('network'):
@@ -555,7 +605,9 @@ def delete_server(args):
             e_uci.delete('network', entry)
     e_uci.save('network')
     firewall.delete_linked_sections(e_uci, f"network/{args['instance']}")
-    
+    # the forwardings of the other servers to its zone
+    wireguard.sync_peer_traffic(e_uci)
+
     return {"result": "success"}
 
 
@@ -761,7 +813,7 @@ def delete_peer(args):
     return {"result": "success"}
 
 
-def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_name, server_network, server_endpoint, server_port, login_url=None, fallback_endpoints=()):
+def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_name, server_network, server_endpoint, server_port, login_url=None, fallback_endpoints=(), linked_networks=()):
     """Generate peer config reusing EUci instance and pre-computed server data."""
     config = "[Interface]\n"
     config += f"# Name = {u.get('network', peer_id, 'ns_name')}\n"
@@ -790,6 +842,8 @@ def __generate_peer_config(u, peer_id, server_public_key, server_dns, server_nam
     else:
         addresses = list(u.get('network', peer_id, 'ns_local_routes', list=True, dtype=str, default=[]))
         addresses.append(server_network)
+        # the networks of the servers linked to this one, see nethsec.wireguard: the answers go back through the tunnel
+        addresses += [network for network in linked_networks if network not in addresses]
         config += f"AllowedIPs = {','.join(addresses)}\n"
     config += f"Endpoint = {__format_endpoint(server_endpoint, server_port)}\n"
     if fallback_endpoints:
@@ -851,6 +905,7 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts, devices)
     server_network = u.get('network', instance, 'ns_network')
     server_endpoint = u.get('network', instance, 'ns_public_endpoint')
     fallback_endpoints = __fallback_endpoints(u, instance)
+    linked_networks = wireguard.linked_networks(u, instance)
     server_enabled = not u.get('network', instance, 'disabled', dtype=bool, default=False)
     server_mtu = u.get('network', instance, 'mtu', dtype=int, default=0)
     server_dns = u.get('network', instance, 'ns_dns', dtype=str, list=True, default=[])
@@ -886,7 +941,7 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts, devices)
             "mtu": u.get('network', p, 'ns_mtu', dtype=int, default=0),
             "config": __generate_peer_config(
                 u, p, server_public_key, server_dns, server_name,
-                server_network, server_endpoint, server_port, login_url, fallback_endpoints
+                server_network, server_endpoint, server_port, login_url, fallback_endpoints, linked_networks
             ),
             "user": u.get('network', p, 'ns_user', default=''),
             "authenticated": gated and reserved_ip in server_sessions,
@@ -928,7 +983,10 @@ def __get_server_configuration(u, instance, peers_status, gate, alerts, devices)
         # false when the login is required but the firewall doesn't enforce it, see ns-wgauth
         "auth_enforced": gated and instance in sessions,
         # true when the login rules couldn't be loaded and the firewall blocks the whole VPN instead
-        "auth_blocked": gated and instance in gate['blocked']
+        "auth_blocked": gated and instance in gate['blocked'],
+        # the traffic between peers, see nethsec.wireguard
+        "client_to_client": wireguard.allows_client_to_client(u, instance),
+        "reachable_servers": wireguard.get_reachable_servers(u, instance),
     }
 
 
@@ -1398,7 +1456,9 @@ if cmd == 'list':
             "user_db": "main",
             "auth_timeout": 28800,
             "device_binding": False,
-            "machine_id": False
+            "machine_id": False,
+            "client_to_client": False,
+            "reachable_servers": ["wg2"]
         },
         "edit-server": {
             "instance": "wg1",
@@ -1414,7 +1474,9 @@ if cmd == 'list':
             "user_db": "main",
             "auth_timeout": 28800,
             "device_binding": False,
-            "machine_id": False
+            "machine_id": False,
+            "client_to_client": False,
+            "reachable_servers": ["wg2"]
         },
         "delete-server": {"instance": "wg1"},
         "get-peer-defaults": {"instance": "wg1"},

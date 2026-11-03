@@ -8595,14 +8595,15 @@ Response example:
   "public_endpoint": "79.19.71.172",
   "auth_modes": ["key", "key_password", "key_password_otp"],
   "max_fallback_endpoints": 4,
-  "device_binding": true
+  "device_binding": true,
+  "peer_traffic": true
 }
 ```
 
 `auth_modes` lists the values accepted by the `auth_mode` parameter of `add-server`: a client can show the login
 options only when it's present. `max_fallback_endpoints` is the most `fallback_endpoints` a server can have: a client
 can show them only when it's present. Likewise `device_binding` tells that the `device_binding` and `machine_id`
-parameters are supported.
+parameters are supported, and `peer_traffic` that `client_to_client` and `reachable_servers` are.
 
 ### list-servers
 
@@ -8660,7 +8661,9 @@ Response example:
       "machine_id": false,
       "login_url": "http://10.1.122.1:8181/",
       "auth_enforced": true,
-      "auth_blocked": false
+      "auth_blocked": false,
+      "client_to_client": false,
+      "reachable_servers": ["wg2"]
     }
   ]
 }
@@ -8699,6 +8702,14 @@ Device fields of a server:
 - `device_binding`: `true` if the peers must log in from their enrolled device
 - `machine_id`: `true` if the device must also send the ID of its machine
 
+Traffic fields of a server, see [traffic between peers](../../docs/design/wireguard_peer_traffic.md):
+- `client_to_client`: `true` if the peers of the server can connect to each other
+- `reachable_servers`: the servers whose peers the peers of this server can connect to, one way. The servers whose
+  `reachable_servers` list this one can connect to its peers
+
+The `AllowedIPs` of the `config` of a peer that doesn't route all its traffic also include the networks of the servers
+linked to its server, both ways: the answers of the peers of a listed server go back through their own tunnel.
+
 
 ### add-server
 
@@ -8728,6 +8739,14 @@ Parameters:
   client that signs the login; the browser and the official WireGuard apps can't. Requires `auth_mode` other than
   `key`. See [device binding](../../docs/design/wireguard_device_binding.md)
 - `machine_id` (optional): `true` to also require the hardware ID of the enrolled machine. Requires `device_binding`
+- `client_to_client` (optional): `true` to let the peers of the server connect to each other, default `false`. A
+  firewall rule accepts the traffic from the zone of the server to itself. With a login, only the logged-in peers
+  can connect
+- `reachable_servers` (optional): the WireGuard servers whose peers the peers of this server can connect to, like
+  `["wg2"]`, default none. One way: a forwarding from the zone of this server to the zone of each one; the answers
+  pass as established traffic. For the other way, the other server lists this one. The configurations of the peers
+  of both servers route the network of the other one, so the peers that don't route all their traffic need their
+  configuration again. See [traffic between peers](../../docs/design/wireguard_peer_traffic.md)
 
 Example of a server that requires the login:
 ```
@@ -8743,6 +8762,11 @@ Validation errors of the login parameters:
 - `auth_timeout`: `invalid`
 - `device_binding`: `invalid`, `login_required`
 - `machine_id`: `invalid`, `device_binding_required`
+
+Validation errors of the traffic parameters:
+- `client_to_client`: `invalid`
+- `reachable_servers`: `invalid` if it isn't a list of strings, `server_not_found` (not a WireGuard server),
+  `duplicate_server`, `same_server` on `edit-server` (the server itself)
 
 With `key_password_otp`, the users linked to the peers get an OTP secret if they don't have one yet, see
 `download-peer-2fa`.
@@ -8760,7 +8784,8 @@ Parameters:
 All other parameters are the same as in `add-server`. If `auth_mode` is missing, the login options keep their current
 values; `auth_mode` `key` removes the users database and the device binding of the server. Missing `device_binding`
 and `machine_id` keep their values too; `device_binding` `false` also turns `machine_id` off. If `fallback_endpoints`
-is missing, the fallback endpoints stay as they are; an empty list removes them.
+is missing, the fallback endpoints stay as they are; an empty list removes them. Missing `client_to_client` and
+`reachable_servers` keep their values too; an empty `reachable_servers` removes the list.
 
 ### delete-server
 
@@ -8768,6 +8793,9 @@ Remove an existing instance and all associated peers:
 ```
 api-cli ns.wireguard delete-server --data '{"instance": "wg1"}'
 ```
+
+The server is also removed from the `reachable_servers` of the other servers, with the firewall forwardings to its
+zone.
 
 ### get-peer-defaults
 
