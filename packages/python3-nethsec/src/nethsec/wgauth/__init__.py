@@ -160,6 +160,27 @@ def requires_otp(uci, server):
     return get_auth_mode(uci, server) == "key_password_otp"
 
 
+# the values UCI reads as booleans, as euci.boolean.VALUES
+_BOOLEANS = {
+    "0": False,
+    "no": False,
+    "off": False,
+    "false": False,
+    "disabled": False,
+    "1": True,
+    "yes": True,
+    "on": True,
+    "true": True,
+    "enabled": True,
+}
+
+
+def _get_strict_flag(uci, server, option):
+    # euci gives the default for a value it can't read: a typo would turn the option off and open the gate
+    value = uci.get("network", server, option, default="0")
+    return _BOOLEANS.get(str(value).lower(), True)
+
+
 def requires_device(uci, server):
     """
     Check if the peers of a WireGuard server must log in from the device enrolled for them.
@@ -169,14 +190,9 @@ def requires_device(uci, server):
       - server -- WireGuard server interface name
 
     Returns:
-      - True if the server requires the login and its `ns_device_binding` option is set
+      - True if the server requires the login and its `ns_device_binding` option is set, to any value but a false one
     """
-    try:
-        binding = uci.get("network", server, "ns_device_binding", dtype=bool, default=False)
-    except ValueError:
-        # a typo must not open the gate
-        binding = True
-    return is_gated(uci, server) and binding
+    return is_gated(uci, server) and _get_strict_flag(uci, server, "ns_device_binding")
 
 
 def requires_machine_id(uci, server):
@@ -188,13 +204,9 @@ def requires_machine_id(uci, server):
       - server -- WireGuard server interface name
 
     Returns:
-      - True if the server requires device binding and its `ns_machine_id` option is set
+      - True if the server requires device binding and its `ns_machine_id` option is set, to any value but a false one
     """
-    try:
-        machine_id = uci.get("network", server, "ns_machine_id", dtype=bool, default=False)
-    except ValueError:
-        machine_id = True
-    return requires_device(uci, server) and machine_id
+    return requires_device(uci, server) and _get_strict_flag(uci, server, "ns_machine_id")
 
 
 def get_server_public_key(uci, server):
