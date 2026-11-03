@@ -327,7 +327,8 @@ def test_remove_user_peers_key_servers(tmp_path):
 def test_find_stale_links(tmp_path):
     u = _setup_db(tmp_path)
     assert wgauth.user_names(u, "wgauth_users") == {"alice", "carol"}
-    assert wgauth.user_names(u) == {"alice", "carol"}
+    # all the databases: with the users that other tests saved in the default savedir, see _setup_db
+    assert {"alice", "carol"} <= wgauth.user_names(u)
     # bob doesn't exist: his peer on wg1 is a stale link, a new bob would get it
     assert wgauth.find_stale_links(u, "Bob", "wgauth_users") == ["wg1_ns_bbbbbbbb_peer"]
     # alice exists: her links are hers
@@ -1181,6 +1182,12 @@ def test_device_options(tmp_path):
     # a typo must not turn the binding off
     u.set("network", "wg1", "ns_device_binding", "maybe")
     assert wgauth.requires_device(u, "wg1")
+    u.set("network", "wg1", "ns_machine_id", "typo")
+    assert wgauth.requires_machine_id(u, "wg1")
+    # the other ways to write false
+    u.set("network", "wg1", "ns_device_binding", "Off")
+    assert not wgauth.requires_device(u, "wg1")
+    assert not wgauth.requires_machine_id(u, "wg1")
 
 
 def test_build_state_devices(tmp_path, mocker):
