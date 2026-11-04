@@ -59,7 +59,8 @@ and ping fails.
 A forwarding accepts the new connections from its source zone only. The answers of the target pass as established
 traffic (the `ct state established,related accept` of the fw4 forward chain), so one entry is enough for the peers of
 a server to use the services of the peers of another one, and the peers of the other server can't start connections
-back. The user interface says it next to the list: "For the other way, add this server to their list."
+back. The user interface lists the other servers one per row, with a checkbox, and says it under the list: "For
+the other way, check this server in their settings."
 
 ### The routes of the peers
 
