@@ -342,8 +342,9 @@ By default the peers of a server can't reach each other, nor the peers of anothe
 drawer open it, see [the design](docs/design/wireguard_peer_traffic.md):
 
 - **Traffic between peers**: the peers of this server can connect to each other.
-- **Access to the peers of other servers**: the peers of this server can start connections to the peers of the
-  servers listed. One way: for the other way, add this server to their list.
+- **Access to the peers of other servers**: one row per other server, with a checkbox. The peers of this server can
+  start connections to the peers of the servers checked. One way: for the other way, check this server in their
+  settings.
 
 To install it on an image built before, copy the files as in [Update without rebuilding](#update-without-rebuilding),
 with the web UI as in [step 9](#install-it-on-the-firewall-without-rebuilding).
@@ -362,10 +363,10 @@ Remove-NetFirewallRule -DisplayName "Ping from the VPN"
 | Log in on both computers, then ping the VPN address of one from the other (`ping 10.219.220.4`) | It answers |
 | Log out one of them | No answer: with a login, only the logged-in peers connect |
 | Turn the switch off, apply | No answer again, and the rule is gone from `forward_wg1vpn` |
-| Add a second server with a peer, connect a computer or a phone to it. On the first server, choose the second in **Access to the peers of other servers** | The drawer warns that the configurations of the peers change. After apply, the card of the first server shows *Reaches the peers of: <second>* and the other card *Reached by the peers of: <first>*. `forward_wg1vpn` has `jump accept_to_wg2vpn` |
+| Add a second server with a peer, connect a computer or a phone to it. On the first server, check the second in **Access to the peers of other servers** | The drawer warns that the configurations of the peers change. After apply, the card of the first server shows *Reaches the peers of: <second>* and the other card *Reached by the peers of: <first>*. `forward_wg1vpn` has `jump accept_to_wg2vpn` |
 | Look at the configuration of a peer that doesn't route all its traffic, on either server | Its `AllowedIPs` also has the network of the other server: the answers go back through the tunnel. Import it again on the device. The peers that route all their traffic (`0.0.0.0/0`) need nothing |
 | From a peer of the first server, ping a peer of the second | It answers |
-| From the peer of the second server, ping a peer of the first | No answer: one way. Add the first server to the list of the second for this way |
+| From the peer of the second server, ping a peer of the first | No answer: one way. Check the first server in the settings of the second for this way |
 | Delete the second server | The first loses it from its list, and `uci show firewall \| grep '_to_wg'` shows no forwarding to its zone |
 
 ## Settings
